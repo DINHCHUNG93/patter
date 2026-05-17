@@ -7,11 +7,14 @@ integrates with Patter's telephony pipeline without transcoding.
 
 from __future__ import annotations
 
+import logging
 import os
 from enum import IntEnum, StrEnum
-from typing import Any, AsyncIterator, Optional
+from typing import ClassVar, Any, AsyncIterator, Optional
 
 from getpatter.providers.base import TTSProvider
+
+logger = logging.getLogger("getpatter.providers.lmnt_tts")
 
 try:  # pragma: no cover - trivial import guard
     import aiohttp
@@ -57,6 +60,9 @@ class LMNTTTS(TTSProvider):
     Default output is 16 kHz PCM_S16LE (``format='raw'``) which matches the
     Patter pipeline's standard telephony sample rate.
     """
+
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "lmnt"
 
     def __init__(
         self,
@@ -126,12 +132,27 @@ class LMNTTTS(TTSProvider):
             "top_p": self.top_p,
         }
 
+    def _record_synthesis_cost(self, text: str) -> None:
+        """Emit ``patter.cost.tts_chars`` for the synthesised text."""
+        try:
+            from getpatter.observability.attributes import record_patter_attrs
+
+            record_patter_attrs(
+                {
+                    "patter.cost.tts_chars": len(text),
+                    "patter.tts.provider": "lmnt",
+                }
+            )
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("_record_synthesis_cost failed", exc_info=True)
+
     async def synthesize(self, text: str) -> AsyncIterator[bytes]:
         """Stream audio bytes for ``text``.
 
         With the default ``format='raw'`` these are PCM_S16LE chunks at the
         configured ``sample_rate``.
         """
+        self._record_synthesis_cost(text)
         session = self._ensure_session()
 
         headers = {

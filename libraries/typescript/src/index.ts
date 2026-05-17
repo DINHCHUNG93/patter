@@ -67,6 +67,16 @@ export { callsToCsv, callsToJson } from "./dashboard/export";
 export { mountDashboard, mountApi } from "./dashboard/routes";
 export { notifyDashboard } from "./dashboard/persistence";
 export { LLMLoop, OpenAILLMProvider, DefaultToolExecutor } from "./llm-loop";
+export {
+  MinWordsStrategy,
+  evaluateStrategies as evaluateBargeInStrategies,
+  resetStrategies as resetBargeInStrategies,
+} from "./services/barge-in-strategies";
+export type {
+  BargeInStrategy,
+  EvaluateContext as BargeInEvaluateContext,
+  MinWordsStrategyOptions,
+} from "./services/barge-in-strategies";
 export type {
   LLMProvider,
   LLMChunk,
@@ -122,10 +132,14 @@ export {
 } from "./providers/speechmatics-stt";
 
 // New namespaced TTS classes.
+// `ElevenLabsTTS` is the public facade — defaults to HTTP REST (pcm_16000).
+// `ElevenLabsWebSocketTTS` is the WebSocket streaming variant.
+// `ElevenLabsRestTTS` is a direct alias of the HTTP provider class.
 export { TTS as ElevenLabsTTS } from "./tts/elevenlabs";
 export type { ElevenLabsTTSOptions } from "./tts/elevenlabs";
 export { TTS as ElevenLabsWebSocketTTS } from "./tts/elevenlabs-ws";
 export type { ElevenLabsWebSocketOptions } from "./tts/elevenlabs-ws";
+export { ElevenLabsTTS as ElevenLabsRestTTS } from "./providers/elevenlabs-tts";
 export { TTS as OpenAITTS } from "./tts/openai";
 export type { OpenAITTSOptions } from "./tts/openai";
 export { TTS as CartesiaTTS } from "./tts/cartesia";
@@ -153,6 +167,19 @@ export type { GoogleLLMOptions } from "./llm/google";
 export { SileroVAD } from "./providers/silero-vad";
 export type { SileroVADOptions, SileroSampleRate } from "./providers/silero-vad";
 
+// Noise-suppression audio filters (opt-in, plug into ``agent.audioFilter``).
+// DeepFilterNet — community ONNX, no license required.
+export { DeepFilterNetFilter } from "./providers/deepfilternet-filter";
+export type { DeepFilterNetOptions } from "./providers/deepfilternet-filter";
+// Krisp VIVA — scaffold for parity with Python SDK. Throws at construction
+// until Krisp publishes an official Node binding. See file header.
+export {
+  KrispVivaFilter,
+  KrispSampleRate,
+  KrispFrameDuration,
+} from "./providers/krisp-filter";
+export type { KrispVivaFilterOptions } from "./providers/krisp-filter";
+
 // Telephony carriers.
 export { Carrier as Twilio } from "./telephony/twilio";
 export type { TwilioCarrierOptions } from "./telephony/twilio";
@@ -162,6 +189,9 @@ export type { TelnyxCarrierOptions } from "./telephony/telnyx";
 // Realtime / ConvAI engines.
 export { Realtime as OpenAIRealtime } from "./engines/openai";
 export type { RealtimeOptions as OpenAIRealtimeOptions } from "./engines/openai";
+export { Realtime2 as OpenAIRealtime2 } from "./engines/openai-2";
+export type { Realtime2Options as OpenAIRealtime2Options } from "./engines/openai-2";
+export { OpenAIRealtime2Adapter } from "./providers/openai-realtime-2";
 export { ConvAI as ElevenLabsConvAI } from "./engines/elevenlabs";
 export type { ConvAIOptions as ElevenLabsConvAIOptions } from "./engines/elevenlabs";
 

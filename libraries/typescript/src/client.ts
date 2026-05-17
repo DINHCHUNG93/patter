@@ -39,6 +39,7 @@ import type { MetricsStore } from "./dashboard/store";
 import { Carrier as TwilioCarrier } from "./telephony/twilio";
 import { Carrier as TelnyxCarrier } from "./telephony/telnyx";
 import { Realtime as OpenAIRealtime } from "./engines/openai";
+import { Realtime2 as OpenAIRealtime2 } from "./engines/openai-2";
 import { ConvAI as ElevenLabsConvAI } from "./engines/elevenlabs";
 import { CloudflareTunnel, Static as StaticTunnel } from "./tunnels";
 import { resolveLogRoot } from "./services/call-log";
@@ -50,6 +51,47 @@ import type {
   ConversationStateSnapshot,
   SpeechEventCallback,
 } from "./_speech-events";
+
+/**
+ * Maximum concurrent entries in the prewarm-first-message cache. Bounds
+ * memory consumption when an outbound flood (or attacker-controlled
+ * ``Patter.call`` invocations) would otherwise pile up tens of MB of
+ * orphan TTS bytes that never evict because the carrier never fires
+ * ``start``. When the cap is reached, new prewarm spawns are refused
+ * (logged at warn, call still proceeds with live TTS). See FIX #96 in
+ * the parity audit. Mirrors ``_PREWARM_CACHE_MAX`` in the Python client.
+ */
+export const PREWARM_CACHE_MAX = 200;
+
+/**
+ * Extra grace window beyond ``ringTimeout`` after which a prewarmed
+ * entry that was never consumed is forcibly evicted. The TTS bill was
+ * paid; without TTL eviction a carrier that never fires ``start`` (e.g.
+ * on a never-completed dial that bypassed the status callback) would
+ * leak the bytes for the lifetime of the Patter instance.
+ */
+export const PREWARM_TTL_GRACE_MS = 5_000;
+
+/**
+ * Safety TTL (ms) after which a parked provider WebSocket whose
+ * carrier never fired ``start`` is force-closed. 30 s is a comfortable
+ * superset of typical ring + AMD windows (Twilio ~25 s, Telnyx ~25 s).
+ */
+const PARKED_CONN_TTL_MS = 30_000;
+
+/** Parked provider WebSockets ready for adoption by a per-call StreamHandler. */
+export interface ParkedProviderConnections {
+  /** Pre-opened STT WS (Cartesia today; other adapters may add support later). */
+  stt?: import('ws').WebSocket;
+  /**
+   * Pre-opened TTS WS handle (ElevenLabs WS today). The `bosSent` flag
+   * lets the live `synthesizeStream` skip its own BOS send when the
+   * prewarm pipeline already wrote it.
+   */
+  tts?: import('./providers/elevenlabs-ws-tts').ElevenLabsParkedWS;
+  /** Pre-opened OpenAI Realtime WS (already through `session.updated`). */
+  openaiRealtime?: import('ws').WebSocket;
+}
 
 /** Internal local-mode state — holds carrier + resolved runtime settings. */
 export interface ResolvedLocalConfig {
@@ -85,6 +127,13 @@ function resolvePersistRoot(persist: boolean | string | undefined): string | nul
   return resolveLogRoot();
 }
 
+/** Close every parked socket inside a ``ParkedProviderConnections`` slot. */
+function closeParkedConnections(slot: ParkedProviderConnections): void {
+  if (slot.stt) { try { slot.stt.close(); } catch { /* ignore */ } }
+  if (slot.tts) { try { slot.tts.ws.close(); } catch { /* ignore */ } }
+  if (slot.openaiRealtime) { try { slot.openaiRealtime.close(); } catch { /* ignore */ } }
+}
+
 /** Top-level SDK entry point — wraps a carrier + embedded server + agent loop. */
 export class Patter {
   private localConfig: ResolvedLocalConfig;
@@ -108,20 +157,82 @@ export class Patter {
   private tunnelOwnsWebhookUrl = false;
 
   /**
+   * Pre-rendered first-message TTS audio per outbound call_id. Populated
+   * by :meth:`call` when ``agent.prewarmFirstMessage`` is true; consumed
+   * by the StreamHandler firstMessage emit so the greeting streams
+   * instantly on ``start`` instead of paying the 200-700 ms TTS first-byte
+   * latency. See ``AgentOptions.prewarmFirstMessage``.
+   *
+   * Stores raw bytes in the TTS provider's native sample rate; the
+   * carrier-side audio sender resamples on emit.
+   */
+  private prewarmAudio: Map<string, Buffer> = new Map();
+  /**
+   * Call IDs whose prewarm cache slot has already been consumed —
+   * either by ``popPrewarmAudio`` (cache hit OR miss on the firstMessage
+   * emit path) or by ``recordPrewarmWaste`` (call ended before pickup).
+   * The prewarm task checks this set BEFORE writing bytes so a slow
+   * synth that finishes after the consumer already polled doesn't
+   * orphan bytes in ``prewarmAudio``. See FIX #92 in the parity audit.
+   */
+  private prewarmConsumed: Set<string> = new Set();
+  /**
+   * Background tasks tracked so :meth:`disconnect` can wait on / drop any
+   * still-running prewarm-first-message synth before tearing down.
+   */
+  private prewarmTasks: Set<Promise<unknown>> = new Set();
+  /**
+   * TTL eviction timers keyed by call_id so :meth:`disconnect` (and
+   * normal consumption / waste-record paths) can cancel any pending
+   * timer when the slot drains naturally. Without this, the timer
+   * would WARN spuriously after the cache was already emptied.
+   */
+  private prewarmTtlTimers: Map<string, NodeJS.Timeout> = new Map();
+  /**
+   * Pre-opened, fully-handshaked provider WebSockets keyed by
+   * carrier-issued call_id. Populated by ``parkProviderConnections``
+   * during the carrier ringing window; consumed by the per-call
+   * StreamHandler at ``start`` via ``adoptWebSocket(...)`` so STT / TTS
+   * / Realtime audio can flow on the first turn without paying the
+   * 150-900 ms TLS + WS-upgrade + protocol-handshake round-trip again.
+   *
+   * Distinct from ``prewarmAudio`` (which holds pre-rendered TTS bytes
+   * for the first message); the two features are complementary and
+   * orthogonal — both can be active for the same call.
+   *
+   * Each slot may hold up to three parked connections (STT, TTS,
+   * Realtime). Drained by:
+   *   - {@link popPrewarmedConnections} on the carrier ``start`` event
+   *     (consumed normally — the handles transfer to the StreamHandler)
+   *   - {@link recordPrewarmWaste} on call-termination paths (no-answer,
+   *     busy, failed, canceled, AMD voicemail). Closes parked sockets.
+   *   - {@link disconnect} on Patter teardown. Closes all parked sockets.
+   */
+  private prewarmedConnections: Map<string, ParkedProviderConnections> = new Map();
+  /**
+   * TTL eviction handles keyed by call_id for connections that are never
+   * adopted (e.g. a carrier that swallows ``start``). Closes the parked
+   * sockets so they don't leak past the safety window.
+   */
+  private prewarmedConnTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  /**
    * Speech-edge events for turn-taking instrumentation. Public surface: the
    * seven `on*` proxy accessors below plus the `conversationState` snapshot.
    * Defaults are no-ops — existing users who never set a callback see exactly
    * the previous behaviour.
    *
    * See `src/_speech-events.ts` for the full event taxonomy and the
-   * industry-alignment table (LiveKit / Pipecat / OpenAI Realtime).
+   * OpenAI Realtime alignment table.
    */
   public readonly speechEvents: SpeechEvents = new SpeechEvents();
 
   // ---- Speech-edge event callback proxies ------------------------------
-  // The seven `on*` properties below mirror the public APIs of LiveKit
-  // Agents, Pipecat and OpenAI Realtime. They proxy to `speechEvents` so
-  // the dispatcher remains the single source of truth (state + OTel).
+  // The seven `on*` properties below follow the canonical voice-agent
+  // metric set (user/agent state transitions, turn boundaries, TTFT, audio
+  // first-byte) and align with OpenAI Realtime where applicable. They
+  // proxy to `speechEvents` so the dispatcher remains the single source of
+  // truth (state + OTel).
 
   get onUserSpeechStarted(): SpeechEventCallback | null {
     return this.speechEvents.onUserSpeechStarted;
@@ -174,8 +285,8 @@ export class Patter {
 
   /**
    * Snapshot of the current per-side state of the call.
-   * Mirrors LiveKit's `user_state_changed` / `agent_state_changed`
-   * payloads. Read-only and safe to call at any time.
+   * Returns the user_state / agent_state payload shape — read-only and
+   * safe to call at any time.
    */
   get conversationState(): ConversationStateSnapshot {
     return this.speechEvents.conversationState;
@@ -320,7 +431,7 @@ export class Patter {
         );
       }
       const engine = opts.engine;
-      if (engine instanceof OpenAIRealtime) {
+      if (engine instanceof OpenAIRealtime || engine instanceof OpenAIRealtime2) {
         working = {
           ...working,
           provider: 'openai_realtime',
@@ -340,7 +451,7 @@ export class Patter {
         };
       } else {
         throw new Error(
-          "Unknown engine. Expected OpenAIRealtime or ElevenLabsConvAI instance.",
+          "Unknown engine. Expected OpenAIRealtime, OpenAIRealtime2, or ElevenLabsConvAI instance.",
         );
       }
     } else if (
@@ -435,6 +546,21 @@ export class Patter {
     }
     if (!opts.agent.systemPrompt && opts.agent.provider !== 'pipeline') {
       throw new Error('agent.systemPrompt is required');
+    }
+
+    // Pre-import AEC at serve startup so the first call doesn't pay the
+    // 150-400 ms ESM dynamic-import compile / link cost on the hot path.
+    // ``echoCancellation`` is opt-in and rarely set on PSTN, but when it
+    // is the lazy ``await import('./audio/aec')`` inside StreamHandler
+    // serialises with first-message TTS startup and eats first-turn
+    // latency. Eagerly importing here costs nothing for users who never
+    // enable AEC (the module is pure data — no side effects).
+    if (opts.agent.echoCancellation) {
+      try {
+        await import('./audio/aec');
+      } catch (err) {
+        getLogger().debug(`AEC pre-import failed at serve(): ${String(err)}`);
+      }
     }
 
     // Validate port
@@ -551,6 +677,20 @@ export class Patter {
       opts.dashboard ?? true,
       opts.dashboardToken ?? '',
     );
+    // Forward the prewarm-audio accessor so the per-call StreamHandler can
+    // consume the pre-rendered first-message audio (if any) on ``start``.
+    this.embeddedServer.popPrewarmAudio = this.popPrewarmAudio;
+    // Forward the parked-connections accessor so the per-call
+    // StreamHandler can adopt pre-opened STT / TTS / Realtime WSs at
+    // ``start`` instead of paying the cold-handshake on first turn.
+    this.embeddedServer.popPrewarmedConnections = this.popPrewarmedConnections;
+    // Forward the waste-recorder so the carrier status / hangup webhook
+    // handlers can evict the cache when a call terminates before the
+    // media stream starts (no-answer, busy, failed, canceled, or AMD
+    // voicemail). Without this, ``recordPrewarmWaste`` is only invoked
+    // from ``endCall`` and the server-side teardown path leaks the
+    // bytes for the lifetime of the Patter instance. See FIX #91.
+    this.embeddedServer.recordPrewarmWaste = this.recordPrewarmWaste;
     try {
       await this.embeddedServer.start(port);
       // Server is now in `listen` state on 127.0.0.1:port — safe to place
@@ -594,6 +734,374 @@ export class Patter {
     });
   }
 
+  /**
+   * Pop and return the pre-synthesised first-message audio for ``callId``.
+   *
+   * Returns ``undefined`` when ``agent.prewarmFirstMessage`` was not set
+   * for the originating outbound call, or when the synth was still in
+   * flight at the moment the carrier emitted ``start`` (cache miss — the
+   * StreamHandler falls back to live TTS).
+   *
+   * Called by the per-call StreamHandler at the start of the firstMessage
+   * emit. Returning bytes here lets the handler skip the live TTS
+   * synthesis and stream the cached buffer directly.
+   *
+   * Marks ``callId`` as consumed regardless of cache hit/miss so a slow
+   * synth task that finishes after this call drops its bytes instead of
+   * orphaning them in ``prewarmAudio``. See FIX #92.
+   */
+  popPrewarmAudio = (callId: string): Buffer | undefined => {
+    this.prewarmConsumed.add(callId);
+    const ttl = this.prewarmTtlTimers.get(callId);
+    if (ttl !== undefined) {
+      clearTimeout(ttl);
+      this.prewarmTtlTimers.delete(callId);
+    }
+    const buf = this.prewarmAudio.get(callId);
+    if (buf !== undefined) this.prewarmAudio.delete(callId);
+    return buf;
+  };
+
+  /**
+   * Log a warning if a prewarmed greeting was paid for but never used.
+   * The TTS bill for ``agent.firstMessage`` has already been incurred by
+   * the background synth task, so the user should know — opt-in feature
+   * with a known cost surface.
+   *
+   * Idempotent: the second call for the same ``callId`` is a no-op, so
+   * the status callback firing first and ``endCall`` running afterwards
+   * (or vice-versa) does not double-WARN. Public so the embedded
+   * server's webhook handlers can invoke it on no-answer / busy /
+   * failed / canceled / AMD-machine paths. See FIX #91.
+   */
+  recordPrewarmWaste = (callId: string): void => {
+    // Always drain any parked provider WS — they're cheap to discard
+    // and we don't want to leak open sockets when the call dies.
+    this.closePrewarmedConnections(callId);
+    if (this.prewarmConsumed.has(callId)) {
+      this.prewarmAudio.delete(callId);
+      return;
+    }
+    this.prewarmConsumed.add(callId);
+    const ttl = this.prewarmTtlTimers.get(callId);
+    if (ttl !== undefined) {
+      clearTimeout(ttl);
+      this.prewarmTtlTimers.delete(callId);
+    }
+    const buf = this.prewarmAudio.get(callId);
+    if (buf !== undefined) {
+      this.prewarmAudio.delete(callId);
+      getLogger().warn(
+        `Prewarm wasted for call ${callId} — first-message TTS already paid ` +
+          `(~${buf.byteLength} bytes synthesised) but call ended before pickup.`,
+      );
+    }
+  };
+
+  /**
+   * Pop and return the parked provider WebSockets for ``callId``, or
+   * ``undefined`` when no parked connections exist.
+   *
+   * Wired into ``EmbeddedServer.popPrewarmedConnections`` so the
+   * per-call ``StreamHandler`` can adopt the parked sockets at the
+   * carrier ``start`` event instead of opening fresh ones — saving
+   * ~150-900 ms of cold-start handshake on the first turn.
+   */
+  popPrewarmedConnections = (callId: string): ParkedProviderConnections | undefined => {
+    const slot = this.prewarmedConnections.get(callId);
+    if (slot === undefined) return undefined;
+    this.prewarmedConnections.delete(callId);
+    const ttl = this.prewarmedConnTimers.get(callId);
+    if (ttl !== undefined) {
+      clearTimeout(ttl);
+      this.prewarmedConnTimers.delete(callId);
+    }
+    return slot;
+  };
+
+  /**
+   * Close any parked provider WebSockets for ``callId``. Wired into
+   * ``EmbeddedServer.closePrewarmedConnections`` so call-termination
+   * paths (no-answer, busy, failed, canceled, AMD voicemail) drop the
+   * sockets cleanly instead of leaving them to the upstream timeout.
+   */
+  closePrewarmedConnections = (callId: string): void => {
+    const slot = this.prewarmedConnections.get(callId);
+    if (slot === undefined) return;
+    this.prewarmedConnections.delete(callId);
+    const ttl = this.prewarmedConnTimers.get(callId);
+    if (ttl !== undefined) {
+      clearTimeout(ttl);
+      this.prewarmedConnTimers.delete(callId);
+    }
+    closeParkedConnections(slot);
+  };
+
+  /**
+   * Open and park provider WebSockets in parallel with the carrier-side
+   * ``initiateCall``. Unlike :meth:`spawnProviderWarmup` (which closes
+   * the WS after a brief idle), the sockets opened here stay OPEN and
+   * are handed off to the per-call ``StreamHandler`` on ``start``.
+   *
+   * This is the structural fix for first-turn cold-start: on Node's
+   * ``ws`` package, opening + closing a WS does NOT warm TLS for the
+   * next open — every fresh ``new WebSocket()`` re-pays the full
+   * TCP + TLS + HTTP-101 round-trip. By keeping the WS open and
+   * adopting it directly, the live first turn skips the handshake
+   * entirely (saves ~150-900 ms depending on provider).
+   *
+   * Best-effort: each provider's parking task is wrapped in
+   * ``Promise.allSettled`` so a slow or failing endpoint cannot block
+   * the others. Providers without ``openParkedConnection`` contribute
+   * nothing — the call falls through to the cold ``connect()`` path
+   * for that provider.
+   */
+  private parkProviderConnections(agent: AgentOptions, callId: string): void {
+    const stt = agent.stt as { openParkedConnection?: () => Promise<import('ws').WebSocket> } | undefined;
+    const tts = agent.tts as { openParkedConnection?: () => Promise<import('./providers/elevenlabs-ws-tts').ElevenLabsParkedWS> } | undefined;
+    const sttOpen = typeof stt?.openParkedConnection === 'function' ? stt.openParkedConnection.bind(stt) : null;
+    const ttsOpen = typeof tts?.openParkedConnection === 'function' ? tts.openParkedConnection.bind(tts) : null;
+    if (!sttOpen && !ttsOpen) return;
+
+    const slot: ParkedProviderConnections = {};
+    this.prewarmedConnections.set(callId, slot);
+
+    const startedAt = Date.now();
+    const tasks: Array<Promise<void>> = [];
+    if (sttOpen) {
+      tasks.push((async () => {
+        try {
+          const ws = await sttOpen();
+          // Slot may have been drained while we were opening (call
+          // failed early, ``start`` already arrived and consumer
+          // already adopted nothing, etc.). Close cleanly in that case.
+          if (this.prewarmedConnections.get(callId) !== slot) {
+            try { ws.close(); } catch { /* ignore */ }
+            return;
+          }
+          slot.stt = ws;
+          getLogger().info(
+            `[PREWARM] callId=${callId} provider=stt ms=${Date.now() - startedAt}`,
+          );
+        } catch (err) {
+          getLogger().debug(`Park STT failed for ${callId}: ${String(err)}`);
+        }
+      })());
+    }
+    if (ttsOpen) {
+      tasks.push((async () => {
+        try {
+          const parked = await ttsOpen();
+          if (this.prewarmedConnections.get(callId) !== slot) {
+            try { parked.ws.close(); } catch { /* ignore */ }
+            return;
+          }
+          slot.tts = parked;
+          getLogger().info(
+            `[PREWARM] callId=${callId} provider=tts ms=${Date.now() - startedAt}`,
+          );
+        } catch (err) {
+          getLogger().debug(`Park TTS failed for ${callId}: ${String(err)}`);
+        }
+      })());
+    }
+
+    const task = (async () => {
+      await Promise.allSettled(tasks);
+    })();
+    this.prewarmTasks.add(task);
+    void task.finally(() => {
+      this.prewarmTasks.delete(task);
+      // Schedule TTL cleanup so a never-adopted slot is force-closed.
+      if (!this.prewarmedConnections.has(callId)) return;
+      const handle = setTimeout(() => {
+        this.prewarmedConnTimers.delete(callId);
+        const orphan = this.prewarmedConnections.get(callId);
+        if (orphan === undefined) return;
+        this.prewarmedConnections.delete(callId);
+        closeParkedConnections(orphan);
+        getLogger().warn(
+          `[PREWARM] parked connections evicted by TTL for ${callId} — ` +
+            `call never reached start (~${(PARKED_CONN_TTL_MS / 1000).toFixed(0)}s).`,
+        );
+      }, PARKED_CONN_TTL_MS);
+      handle.unref?.();
+      this.prewarmedConnTimers.set(callId, handle);
+    });
+  }
+
+  /**
+   * Spawn a fire-and-forget task that warms up STT / TTS / LLM in
+   * parallel with the carrier-side ``initiateCall``.
+   *
+   * Best-effort: each provider's optional ``warmup()`` is wrapped in
+   * ``Promise.allSettled`` so a slow or failing endpoint cannot block
+   * the others. Providers without ``warmup`` contribute nothing.
+   */
+  private spawnProviderWarmup(agent: AgentOptions): void {
+    const targets: Array<{ name: string; fn: () => Promise<void> }> = [];
+    const collect = (provider: unknown, label: string): void => {
+      if (!provider || typeof provider !== 'object') return;
+      const fn = (provider as { warmup?: () => Promise<void> }).warmup;
+      if (typeof fn !== 'function') return;
+      targets.push({
+        name: label,
+        fn: fn.bind(provider) as () => Promise<void>,
+      });
+    };
+    collect(agent.stt, 'stt');
+    collect(agent.tts, 'tts');
+    collect(agent.llm, 'llm');
+    if (targets.length === 0) return;
+
+    const task = (async () => {
+      const results = await Promise.allSettled(targets.map((t) => t.fn()));
+      results.forEach((r, i) => {
+        if (r.status === 'rejected') {
+          getLogger().debug(
+            `Provider warmup failed (${targets[i].name}): ${String(r.reason)}`,
+          );
+        }
+      });
+    })();
+    this.prewarmTasks.add(task);
+    void task.finally(() => this.prewarmTasks.delete(task));
+  }
+
+  /**
+   * Pre-render ``agent.firstMessage`` to TTS bytes during the ringing
+   * window and stash them in ``prewarmAudio.set(callId, buf)``.
+   *
+   * Skipped silently when ``agent.prewarmFirstMessage`` is false or
+   * when ``agent.tts`` / ``agent.firstMessage`` is missing. The synth
+   * is bounded by ``ringTimeout`` (default 25 s) so a never-answered
+   * call doesn't tie up the TTS connection. On timeout / error the
+   * cache is left empty and the StreamHandler falls back to live TTS.
+   *
+   * **Pipeline mode only.** Realtime / ConvAI provider modes never
+   * consume the prewarm cache (the StreamHandler for those modes runs
+   * its first-message emit through the provider's own audio path).
+   * Spawning the prewarm in those modes pays the TTS bill for nothing
+   * — refused with a warn.
+   *
+   * **Capped at ``PREWARM_CACHE_MAX`` concurrent entries.** Refused
+   * with a warn when the cap is reached (the call still proceeds —
+   * StreamHandler falls back to live TTS).
+   */
+  private spawnPrewarmFirstMessage(
+    agent: AgentOptions,
+    callId: string,
+    ringTimeout: number | null | undefined,
+  ): void {
+    if (!agent.prewarmFirstMessage) return;
+    // FIX #94 — Realtime / ConvAI never consume the cache. Refuse early
+    // so the user notices the silent TTS waste instead of paying for a
+    // synth no caller will ever hear.
+    const providerMode = (agent.provider as string | undefined) ?? 'openai_realtime';
+    if (providerMode !== 'pipeline') {
+      getLogger().warn(
+        `agent.prewarmFirstMessage=true is only supported in pipeline mode ` +
+          `(provider=${providerMode}); skipping pre-synth to avoid wasted TTS spend.`,
+      );
+      return;
+    }
+    const firstMessage = agent.firstMessage ?? '';
+    const tts = agent.tts;
+    if (!firstMessage || !tts) return;
+    if (typeof tts.synthesizeStream !== 'function') return;
+
+    // FIX #96 — refuse to spawn when the cache (live entries +
+    // in-flight synth tasks) would exceed the cap. Counting both
+    // active entries AND pending tasks keeps the bound honest under
+    // outbound-flood conditions where carrier ``start`` events lag.
+    const inFlight = this.prewarmAudio.size + this.prewarmTasks.size;
+    if (inFlight >= PREWARM_CACHE_MAX) {
+      getLogger().warn(
+        `Prewarm cache full (${inFlight}/${PREWARM_CACHE_MAX} in-flight) — ` +
+          `skipping pre-synth for call ${callId}; falling back to live TTS at pickup.`,
+      );
+      return;
+    }
+
+    const timeoutMs = (typeof ringTimeout === 'number' ? ringTimeout : 25) * 1000;
+
+    const task = (async () => {
+      try {
+        const accumulate = async (): Promise<Buffer> => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of tts.synthesizeStream(firstMessage)) {
+            // ``synthesizeStream`` typed return is ``Buffer``, but real
+            // adapters may yield a ``Uint8Array`` (or anything Buffer-y).
+            // Guard at runtime so we never crash on a typed-but-untrue
+            // chunk.
+            const u = chunk as unknown;
+            if (Buffer.isBuffer(u)) chunks.push(u);
+            else if (ArrayBuffer.isView(u))
+              chunks.push(Buffer.from((u as Uint8Array).buffer, (u as Uint8Array).byteOffset, (u as Uint8Array).byteLength));
+          }
+          return Buffer.concat(chunks);
+        };
+        const timer = new Promise<Buffer>((_resolve, reject) =>
+          setTimeout(
+            () => reject(new Error('prewarm-first-message timeout')),
+            timeoutMs,
+          ).unref?.(),
+        );
+        const buf = await Promise.race([accumulate(), timer]);
+        if (buf.byteLength > 0) {
+          // FIX #92 — race guard. If the consumer already polled (cache
+          // hit or miss) before the synth finished, the StreamHandler
+          // has already fallen back to live TTS; writing bytes here
+          // would orphan them in ``prewarmAudio`` until ``endCall`` ever
+          // runs.
+          if (this.prewarmConsumed.has(callId)) {
+            getLogger().warn(
+              `Prewarm orphaned for call ${callId} — synth completed ` +
+                `(~${buf.byteLength} bytes) AFTER consumer polled; bytes dropped, ` +
+                `TTS bill already paid.`,
+            );
+            return;
+          }
+          this.prewarmAudio.set(callId, buf);
+          getLogger().debug(
+            `Prewarm first-message ready for call ${callId} (${buf.byteLength} bytes)`,
+          );
+        }
+      } catch (err) {
+        getLogger().debug(
+          `Prewarm first-message failed for call ${callId}: ${String(err)}`,
+        );
+      }
+    })();
+    this.prewarmTasks.add(task);
+    void task.finally(() => {
+      this.prewarmTasks.delete(task);
+      // FIX #96 — schedule TTL eviction once the synth task has produced
+      // (or failed to produce) cache bytes. If the carrier never fires
+      // ``start`` AND the status / hangup callback never runs (e.g.
+      // cloud-side telephony quirk), the entry would otherwise leak.
+      // The timer is no-op when the slot has already been drained.
+      if (!this.prewarmAudio.has(callId)) return;
+      const ttlMs = timeoutMs + PREWARM_TTL_GRACE_MS;
+      const handle = setTimeout(() => {
+        this.prewarmTtlTimers.delete(callId);
+        const orphan = this.prewarmAudio.get(callId);
+        if (orphan === undefined) return;
+        this.prewarmAudio.delete(callId);
+        this.prewarmConsumed.add(callId);
+        getLogger().warn(
+          `Prewarm bytes evicted by TTL — call ${callId} never consumed them ` +
+            `(~${orphan.byteLength} bytes synthesised, ${(ttlMs / 1000).toFixed(1)}s ` +
+            `after ringTimeout).`,
+        );
+      }, ttlMs);
+      // Don't keep the event loop alive on the eviction timer alone —
+      // matches the behaviour of the timeout race above.
+      handle.unref?.();
+      this.prewarmTtlTimers.set(callId, handle);
+    });
+  }
+
   /** Place an outbound call via the configured carrier. */
   async call(options: LocalCallOptions): Promise<void> {
     if (!options.to) {
@@ -622,6 +1130,15 @@ export class Patter {
     const wantsAmd = options.machineDetection !== false || Boolean(options.voicemailMessage);
     if (this.embeddedServer) {
       this.embeddedServer.onMachineDetection = options.onMachineDetection;
+    }
+
+    // Pre-warm provider connections in parallel with the carrier-side
+    // ``initiateCall`` so DNS / TLS / HTTP/2 handshakes complete during
+    // the ringing window (3-15 s typically). Best-effort: warmup
+    // failures are logged at debug and never abort the call. Off when
+    // the user explicitly sets ``agent.prewarm: false``.
+    if (options.agent.prewarm !== false) {
+      this.spawnProviderWarmup(options.agent);
     }
 
     if (carrier.kind === 'telnyx') {
@@ -661,20 +1178,29 @@ export class Patter {
       if (!response.ok) {
         throw new ProvisionError(`Failed to initiate Telnyx call: ${await response.text()}`);
       }
-      if (this.embeddedServer) {
-        try {
-          const body = (await response.clone().json()) as { data?: { call_control_id?: string } };
-          const callId = body.data?.call_control_id;
-          if (callId) {
-            this.embeddedServer.metricsStore.recordCallInitiated({
-              call_id: callId,
-              caller: phoneNumber,
-              callee: options.to,
-              direction: 'outbound',
-            });
-          }
-        } catch {
-          /* non-fatal */
+      let telnyxCallId: string | undefined;
+      try {
+        const body = (await response.clone().json()) as { data?: { call_control_id?: string } };
+        telnyxCallId = body.data?.call_control_id;
+      } catch {
+        /* non-fatal */
+      }
+      if (this.embeddedServer && telnyxCallId) {
+        this.embeddedServer.metricsStore.recordCallInitiated({
+          call_id: telnyxCallId,
+          caller: phoneNumber,
+          callee: options.to,
+          direction: 'outbound',
+        });
+      }
+      if (telnyxCallId) {
+        this.spawnPrewarmFirstMessage(options.agent, telnyxCallId, effectiveRingTimeout);
+        // Park provider WebSockets in parallel so the per-call
+        // StreamHandler can adopt them at ``start`` instead of paying
+        // the cold-handshake on first turn. Off when the user
+        // explicitly sets ``agent.prewarm: false``.
+        if (options.agent.prewarm !== false) {
+          this.parkProviderConnections(options.agent, telnyxCallId);
         }
       }
       return;
@@ -742,31 +1268,41 @@ export class Patter {
     // Also log the Twilio notifications URL so users can self-diagnose
     // call-quality issues (warning 21626, fatal 11100, etc.) without
     // having to hunt them down via the Twilio Console.
-    if (this.embeddedServer) {
-      try {
-        const body = (await response.clone().json()) as {
-          sid?: string;
-          subresource_uris?: { notifications?: string };
-        };
-        const callSid = body.sid;
-        if (callSid) {
-          this.embeddedServer.metricsStore.recordCallInitiated({
-            call_id: callSid,
-            caller: phoneNumber,
-            callee: options.to,
-            direction: 'outbound',
-          });
-          const notificationsPath = body.subresource_uris?.notifications;
-          if (notificationsPath) {
-            getLogger().info(
-              `Outbound call ${callSid} placed. ` +
-                `Twilio notifications: https://api.twilio.com${notificationsPath} ` +
-                '(check here if the call drops with no audio).',
-            );
-          }
-        }
-      } catch {
-        /* non-fatal — the statusCallback will register anyway */
+    let twilioCallSid: string | undefined;
+    let twilioNotificationsPath: string | undefined;
+    try {
+      const body = (await response.clone().json()) as {
+        sid?: string;
+        subresource_uris?: { notifications?: string };
+      };
+      twilioCallSid = body.sid;
+      twilioNotificationsPath = body.subresource_uris?.notifications;
+    } catch {
+      /* non-fatal — the statusCallback will register anyway */
+    }
+    if (this.embeddedServer && twilioCallSid) {
+      this.embeddedServer.metricsStore.recordCallInitiated({
+        call_id: twilioCallSid,
+        caller: phoneNumber,
+        callee: options.to,
+        direction: 'outbound',
+      });
+      if (twilioNotificationsPath) {
+        getLogger().info(
+          `Outbound call ${twilioCallSid} placed. ` +
+            `Twilio notifications: https://api.twilio.com${twilioNotificationsPath} ` +
+            '(check here if the call drops with no audio).',
+        );
+      }
+    }
+    if (twilioCallSid) {
+      this.spawnPrewarmFirstMessage(options.agent, twilioCallSid, effectiveRingTimeout);
+      // Park provider WebSockets in parallel so the per-call
+      // StreamHandler can adopt them at ``start`` instead of paying
+      // the cold-handshake on first turn. Off when the user
+      // explicitly sets ``agent.prewarm: false``.
+      if (options.agent.prewarm !== false) {
+        this.parkProviderConnections(options.agent, twilioCallSid);
       }
     }
   }
@@ -775,8 +1311,45 @@ export class Patter {
    * Stop the embedded server and any running tunnel. Safe to call multiple
    * times. Leaves the instance reusable: a subsequent ``serve()`` works as
    * if the previous lifecycle never happened.
+   *
+   * Also clears any pending TTL eviction timers, awaits in-flight
+   * prewarm-first-message synth tasks (best-effort, with a 1 s safety
+   * timeout), and clears the prewarm cache. Without this a still-running
+   * TTS WS keeps the user billed long after SDK teardown, and stale
+   * entries leak across ``serve`` / ``disconnect`` cycles. See FIX #93.
    */
   async disconnect(): Promise<void> {
+    // Clear pending TTL eviction timers and drain in-flight prewarm
+    // synth tasks BEFORE tearing the server down so the synth tasks
+    // observe a clean cancellation point and don't end up writing
+    // bytes to a cache we're about to drop.
+    for (const handle of this.prewarmTtlTimers.values()) {
+      clearTimeout(handle);
+    }
+    this.prewarmTtlTimers.clear();
+    if (this.prewarmTasks.size > 0) {
+      // Promise.allSettled with a 1 s safety timeout — most synth tasks
+      // observe their wait_for-style timer and return promptly; a
+      // pathological hang must not block the disconnect path.
+      const drain = Promise.allSettled(Array.from(this.prewarmTasks));
+      const timer = new Promise<void>((resolve) =>
+        setTimeout(resolve, 1_000).unref?.(),
+      );
+      await Promise.race([drain, timer]);
+    }
+    this.prewarmTasks.clear();
+    this.prewarmAudio.clear();
+    this.prewarmConsumed.clear();
+    // Close every parked provider WS so we don't leak sockets across
+    // ``serve`` / ``disconnect`` cycles (or process shutdown).
+    for (const handle of this.prewarmedConnTimers.values()) {
+      clearTimeout(handle);
+    }
+    this.prewarmedConnTimers.clear();
+    for (const slot of this.prewarmedConnections.values()) {
+      closeParkedConnections(slot);
+    }
+    this.prewarmedConnections.clear();
     if (this.tunnelHandle) {
       this.tunnelHandle.stop();
       this.tunnelHandle = null;
@@ -832,6 +1405,9 @@ export class Patter {
     if (!callSid) {
       throw new Error('callSid must be a non-empty string');
     }
+    // If the call had a prewarmed first-message that was never consumed
+    // (call ended before pickup), surface the wasted spend.
+    this.recordPrewarmWaste(callSid);
     const carrier = this.localConfig.carrier;
     if (carrier.kind === 'twilio') {
       const auth = Buffer.from(`${carrier.accountSid}:${carrier.authToken}`).toString('base64');

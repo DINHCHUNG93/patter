@@ -8,6 +8,7 @@ import express from 'express';
 import { createServer, Server as HTTPServer } from 'http';
 import { WebSocketServer, WebSocket as WSWebSocket } from 'ws';
 import { OpenAIRealtimeAdapter } from './providers/openai-realtime';
+import { OpenAIRealtime2Adapter } from './providers/openai-realtime-2';
 import { ElevenLabsConvAIAdapter } from './providers/elevenlabs-convai';
 import { createSTT } from './provider-factory';
 import type { STTAdapter } from './provider-factory';
@@ -371,13 +372,14 @@ export function buildAIAdapter(config: LocalConfig, agent: AgentOptions, resolve
     strict: (t as { strict?: boolean }).strict,
   })) ?? [];
   const tools = [...agentTools, TRANSFER_CALL_TOOL, END_CALL_TOOL];
-  const openaiKey = engine && engine.kind === 'openai_realtime' ? engine.apiKey : (config.openaiKey ?? '');
+  const isOpenAIEngine = engine && (engine.kind === 'openai_realtime' || engine.kind === 'openai_realtime_2');
+  const openaiKey = isOpenAIEngine ? engine.apiKey : (config.openaiKey ?? '');
   // Forward optional engine-level Realtime knobs so the high-level
-  // ``OpenAIRealtime`` engine wrapper has the same expressivity as the
-  // underlying ``OpenAIRealtimeAdapter``. Omitting the option keeps the
+  // ``OpenAIRealtime`` / ``OpenAIRealtime2`` engine wrappers have the same
+  // expressivity as the underlying adapters. Omitting the option keeps the
   // adapter's own defaults — backward compat with users on the prior shape.
   const adapterOptions: import('./providers/openai-realtime').OpenAIRealtimeOptions = {};
-  if (engine && engine.kind === 'openai_realtime') {
+  if (isOpenAIEngine) {
     if (engine.reasoningEffort !== undefined) {
       adapterOptions.reasoningEffort = engine.reasoningEffort;
     }
@@ -385,7 +387,13 @@ export function buildAIAdapter(config: LocalConfig, agent: AgentOptions, resolve
       adapterOptions.inputAudioTranscriptionModel = engine.inputAudioTranscriptionModel;
     }
   }
-  return new OpenAIRealtimeAdapter(
+  // Dispatch to the GA-API adapter when the caller passed the
+  // ``OpenAIRealtime2`` engine marker. Falls through to the v1-beta adapter
+  // for ``OpenAIRealtime`` and the legacy no-engine code path.
+  const AdapterCtor = engine && engine.kind === 'openai_realtime_2'
+    ? OpenAIRealtime2Adapter
+    : OpenAIRealtimeAdapter;
+  return new AdapterCtor(
     openaiKey,
     agent.model,
     agent.voice,
@@ -711,6 +719,38 @@ export class EmbeddedServer {
    */
   public onMachineDetection?: (result: MachineDetectionResult) => void | Promise<void>;
 
+  /**
+   * Pre-warm first-message audio accessor wired by ``Patter.serve()``.
+   * The per-call StreamHandler invokes this with its ``callId`` at the
+   * start of the firstMessage emit; a defined return is sent verbatim
+   * in place of running TTS again. ``undefined`` means "no prewarm
+   * cache for this call — fall back to live synthesis". Default is a
+   * no-op so callers that instantiate ``EmbeddedServer`` directly
+   * (tests) work without further setup.
+   */
+  public popPrewarmAudio: (callId: string) => Buffer | undefined = () => undefined;
+
+  /**
+   * Pre-warmed provider WebSocket accessor wired by ``Patter.serve()``.
+   * The per-call StreamHandler invokes this with its ``callId`` at
+   * pipeline init; defined returns hand off pre-opened STT / TTS /
+   * Realtime sockets so the live first turn skips the cold-handshake.
+   * Default is a no-op for direct ``EmbeddedServer`` callers.
+   */
+  public popPrewarmedConnections: (
+    callId: string,
+  ) => import('./client').ParkedProviderConnections | undefined = () => undefined;
+
+  /**
+   * Prewarm waste recorder wired by ``Patter.serve()``. Invoked from
+   * the Twilio status callback (no-answer / busy / failed / canceled)
+   * and the Telnyx call.hangup / AMD-machine handlers so the cache
+   * entry is evicted when the call terminates before the media stream
+   * starts. Default is a no-op so direct ``EmbeddedServer`` callers
+   * (tests) work without further setup. See FIX #91.
+   */
+  public recordPrewarmWaste: (callId: string) => void = () => undefined;
+
   constructor(
     private readonly config: LocalConfig,
     private readonly agent: AgentOptions,
@@ -853,6 +893,24 @@ export class EmbeddedServer {
         if (!Number.isNaN(parsed)) extra.duration_seconds = parsed;
         this.metricsStore.updateCallStatus(callSid, callStatus, extra);
       }
+      // FIX #91 — when the call terminates before the media stream
+      // starts (no-answer / busy / failed / canceled), the prewarm
+      // cache entry would otherwise leak until ``endCall`` runs. Evict
+      // it here so the WARN fires once and the bytes are released
+      // regardless of whether the user calls ``endCall``.
+      if (
+        callSid &&
+        (callStatus === 'no-answer' ||
+          callStatus === 'busy' ||
+          callStatus === 'failed' ||
+          callStatus === 'canceled')
+      ) {
+        try {
+          this.recordPrewarmWaste(callSid);
+        } catch (err) {
+          getLogger().debug(`recordPrewarmWaste threw: ${String(err)}`);
+        }
+      }
       res.status(204).send();
     });
 
@@ -913,6 +971,22 @@ export class EmbeddedServer {
           });
         } catch (err) {
           getLogger().warn(`onMachineDetection callback threw: ${sanitizeLogValue(String(err))}`);
+        }
+      }
+
+      // FIX #91 — when AMD classifies as machine, the agent's first
+      // message will not be played (we drop voicemail or hang up), so
+      // the prewarmed greeting is never consumed. Evict the cache entry
+      // once so the WARN fires regardless of whether ``voicemailMessage``
+      // is configured.
+      if (
+        (answeredBy === 'machine_end_beep' || answeredBy === 'machine_end_silence') &&
+        callSid
+      ) {
+        try {
+          this.recordPrewarmWaste(callSid);
+        } catch (err) {
+          getLogger().debug(`recordPrewarmWaste threw: ${String(err)}`);
         }
       }
 
@@ -1013,6 +1087,7 @@ export class EmbeddedServer {
             to?: string;
             digit?: string;
             result?: string;
+            hangup_cause?: string;
             recording_urls?: { mp3?: string; wav?: string };
             public_recording_urls?: { mp3?: string; wav?: string };
           };
@@ -1080,6 +1155,37 @@ export class EmbeddedServer {
         }
         if (amdCallId && (amdResult === 'machine' || amdResult === 'machine_detected')) {
           await this.handleTelnyxAmdVoicemail(amdCallId);
+          // FIX #91 — when AMD classifies as machine the agent's first
+          // message is replaced by ``voicemailMessage`` (or the call
+          // simply ends), so the prewarmed greeting is never consumed.
+          // Evict it so the WARN fires once.
+          try {
+            this.recordPrewarmWaste(amdCallId);
+          } catch (err) {
+            getLogger().debug(`recordPrewarmWaste threw: ${String(err)}`);
+          }
+        }
+        return res.status(200).send();
+      }
+
+      // FIX #91 — Telnyx fires ``call.hangup`` as the final status
+      // notification. ``hangup_cause`` distinguishes carrier outcomes
+      // (``call_rejected`` / ``busy`` / ``no_answer`` / ``timeout`` /
+      // ``normal_clearing`` / …). When the call never reached the
+      // media stream the prewarm cache leaks unless we evict it here.
+      if (eventType === 'call.hangup') {
+        const hangupCallId = payload.call_control_id ?? '';
+        const hangupCause = String(payload.hangup_cause ?? '');
+        getLogger().info(
+          `Telnyx call.hangup for ${sanitizeLogValue(hangupCallId)} ` +
+            `(cause=${sanitizeLogValue(hangupCause)})`,
+        );
+        if (hangupCallId) {
+          try {
+            this.recordPrewarmWaste(hangupCallId);
+          } catch (err) {
+            getLogger().debug(`recordPrewarmWaste threw: ${String(err)}`);
+          }
         }
         return res.status(200).send();
       }
@@ -1327,6 +1433,8 @@ export class EmbeddedServer {
       buildAIAdapter: (resolvedPrompt: string) => buildAIAdapter(this.config, this.agent, resolvedPrompt),
       sanitizeVariables,
       resolveVariables,
+      popPrewarmAudio: this.popPrewarmAudio,
+      popPrewarmedConnections: this.popPrewarmedConnections,
     };
   }
 
@@ -1362,14 +1470,28 @@ export class EmbeddedServer {
       return Object.fromEntries(Object.entries(snap).filter(([, v]) => v !== undefined));
     };
 
+    const store = this.metricsStore;
     const wrappedStart = async (data: Record<string, unknown>): Promise<void> => {
       if (logger.enabled) {
         const callId = typeof data.call_id === 'string' ? data.call_id : '';
+        // For outbound calls the bridge has no caller/callee in the WS query
+        // string (TwiML for outbound is inline ``<Stream url="…/outbound"/>``
+        // with no <Parameter> tags), so ``data.caller`` / ``data.callee`` are
+        // empty here. The active record in the store was populated by
+        // ``recordCallInitiated`` at dial time and holds the correct numbers
+        // — pull them from there before persisting metadata.json. Without
+        // this fallback every outbound call's metadata.json on disk has
+        // ``caller=""`` / ``callee=""``.
+        const dataCaller = typeof data.caller === 'string' ? data.caller : '';
+        const dataCallee = typeof data.callee === 'string' ? data.callee : '';
+        const active = callId ? store.getActive(callId) : undefined;
+        const resolvedCaller = dataCaller || active?.caller || '';
+        const resolvedCallee = dataCallee || active?.callee || '';
         // Fire-and-forget: call logging must never block the voice flow.
         void logger
           .logCallStart(callId, {
-            caller: typeof data.caller === 'string' ? data.caller : '',
-            callee: typeof data.callee === 'string' ? data.callee : '',
+            caller: resolvedCaller,
+            callee: resolvedCallee,
             telephonyProvider: bridge.telephonyProvider,
             providerMode: agent.provider ?? '',
             agent: agentSnapshot(),
@@ -1401,16 +1523,24 @@ export class EmbeddedServer {
               duration_seconds?: number;
               turns?: unknown[];
               cost?: Record<string, unknown>;
-              latency_p50?: { total_ms?: number };
-              latency_p95?: { total_ms?: number };
-              latency_p99?: { total_ms?: number };
+              latency_avg?: Record<string, number>;
+              latency_p50?: Record<string, number>;
+              latency_p95?: Record<string, number>;
+              latency_p99?: Record<string, number>;
             })
           | null;
+        // Persist full LatencyBreakdown per percentile so the dashboard
+        // hydrate path can render stt/llm/tts breakdown for historical
+        // calls. Keep flat ``p50_ms/p95_ms/p99_ms`` for backward compat.
         const latency = metricsObj
           ? {
               p50_ms: metricsObj.latency_p50?.total_ms ?? null,
               p95_ms: metricsObj.latency_p95?.total_ms ?? null,
               p99_ms: metricsObj.latency_p99?.total_ms ?? null,
+              avg: metricsObj.latency_avg ?? null,
+              p50: metricsObj.latency_p50 ?? null,
+              p95: metricsObj.latency_p95 ?? null,
+              p99: metricsObj.latency_p99 ?? null,
             }
           : null;
         // Fire-and-forget: call logging must never block the voice flow.

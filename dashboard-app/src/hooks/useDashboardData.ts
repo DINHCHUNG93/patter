@@ -14,9 +14,9 @@ import {
   fetchAggregates,
   fetchCalls,
   type Aggregates,
-  type CallRecord,
 } from '../lib/api';
-import { toUiCall, type Call } from '../lib/mappers';
+import type { Call } from '../lib/mappers';
+import { mergeCalls, mergeCallPreserving } from './mergeCalls';
 
 export interface DashboardData {
   readonly calls: Call[];
@@ -24,6 +24,12 @@ export interface DashboardData {
   readonly isStreaming: boolean;
   readonly error: string | null;
   readonly refresh: () => Promise<void>;
+  /**
+   * Optimistically remove ``ids`` from the local call list before the next
+   * server refresh lands. Avoids the brief flash of the deleted row
+   * lingering between the DELETE request and the next snapshot fetch.
+   */
+  readonly removeCallsLocal: (ids: readonly string[]) => void;
 }
 
 const RECONNECT_INITIAL_MS = 1_000;
@@ -36,23 +42,8 @@ const RELEVANT_EVENTS = [
   'call_initiated',
   'call_status',
   'call_end',
+  'calls_deleted',
 ] as const;
-
-function mergeCalls(active: CallRecord[], recent: CallRecord[]): Call[] {
-  const seen = new Set<string>();
-  const merged: Call[] = [];
-  for (const record of active) {
-    if (seen.has(record.call_id)) continue;
-    seen.add(record.call_id);
-    merged.push(toUiCall(record));
-  }
-  for (const record of recent) {
-    if (seen.has(record.call_id)) continue;
-    seen.add(record.call_id);
-    merged.push(toUiCall(record));
-  }
-  return merged;
-}
 
 function describeError(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -100,7 +91,7 @@ export function useDashboardData(): DashboardData {
         fetchAggregates(),
       ]);
       if (!mountedRef.current) return;
-      setCalls(mergeCalls(active, recent));
+      setCalls((prev) => mergeCallPreserving(prev, mergeCalls(active, recent)));
       setAggregates(aggs);
       setError(null);
     } catch (err) {
@@ -197,5 +188,11 @@ export function useDashboardData(): DashboardData {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { calls, aggregates, isStreaming, error, refresh };
+  const removeCallsLocal = useCallback((ids: readonly string[]): void => {
+    if (ids.length === 0) return;
+    const drop = new Set(ids);
+    setCalls((prev) => prev.filter((c) => !drop.has(c.id)));
+  }, []);
+
+  return { calls, aggregates, isStreaming, error, refresh, removeCallsLocal };
 }

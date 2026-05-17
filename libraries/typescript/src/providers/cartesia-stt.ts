@@ -89,6 +89,8 @@ interface CartesiaEvent {
 
 /** Streaming STT adapter for Cartesia's ink-whisper WebSocket API. */
 export class CartesiaSTT {
+  /** Stable pricing/dashboard key — read by stream-handler/metrics. */
+  static readonly providerKey = 'cartesia_stt';
   private ws: WebSocket | null = null;
   private callbacks: Set<TranscriptCallback> = new Set();
   private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
@@ -105,6 +107,38 @@ export class CartesiaSTT {
     if (!apiKey) {
       throw new Error('CartesiaSTT requires a non-empty apiKey');
     }
+  }
+
+  /**
+   * Open a fresh WebSocket without arming any message / keepalive handlers
+   * and without taking ownership on `this.ws`. Returns the OPEN socket so
+   * the caller (the prewarm pipeline) can park it for later adoption via
+   * `adoptWebSocket`. Bounded by `CONNECT_TIMEOUT_MS`.
+   *
+   * Billing safety: opening + parking the WS does not stream audio
+   * (Cartesia STT bills on streamed audio seconds), so no charge is
+   * incurred. Close the returned WS yourself if it is never adopted.
+   */
+  async openParkedConnection(): Promise<WebSocket> {
+    const url = this.buildWsUrl();
+    const ws = new WebSocket(url, {
+      headers: { 'User-Agent': USER_AGENT },
+    });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error('Cartesia STT park connect timeout')),
+        CONNECT_TIMEOUT_MS,
+      );
+      ws.once('open', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      ws.once('error', (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+    return ws;
   }
 
   private buildWsUrl(): string {
@@ -133,6 +167,66 @@ export class CartesiaSTT {
     return `${base}/stt/websocket?${params.toString()}`;
   }
 
+  /**
+   * Pre-call WebSocket warmup for the Cartesia STT `/stt/websocket` endpoint.
+   *
+   * Opens the WS (DNS + TLS + auth handshake), idles ~250 ms so the
+   * Cartesia edge keeps session state warm, then closes. By the time
+   * `connect()` is invoked at call-pickup the resolver and TLS session
+   * are hot — net wire time saving of 200-500 ms.
+   *
+   * Billing safety: Cartesia STT bills on streamed audio seconds (per
+   * https://docs.cartesia.ai/2025-04-16/api-reference/stt/stt). Opening
+   * + closing the WebSocket without forwarding audio does not consume
+   * billable seconds. Best-effort: failures logged at debug level.
+   */
+  async warmup(): Promise<void> {
+    const url = this.buildWsUrl();
+    let ws: WebSocket | null = null;
+    try {
+      ws = await new Promise<WebSocket>((resolve, reject) => {
+        const sock = new WebSocket(url, {
+          headers: { 'User-Agent': USER_AGENT },
+        });
+        const timer = setTimeout(() => {
+          try {
+            sock.close();
+          } catch {
+            // ignore
+          }
+          reject(new Error('Cartesia STT warmup connect timeout'));
+        }, 5000);
+        sock.once('open', () => {
+          clearTimeout(timer);
+          resolve(sock);
+        });
+        sock.once('error', (err: Error) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+      // Idle briefly so the provider edge keeps session state warm.
+      await new Promise<void>((r) => setTimeout(r, 250));
+    } catch (err) {
+      // IMPORTANT: ``String(err)`` for a `ws` handshake failure can
+      // include the request URL, which carries the API key as a
+      // query-string parameter (Cartesia auth pattern). Log only the
+      // HTTP status (when present) or the error class name — never the
+      // full URL or message.
+      getLogger().debug(
+        `Cartesia STT warmup failed (best-effort): ${describeWarmupError(err)}`,
+      );
+    } finally {
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
   /** Open the streaming WebSocket and arm message + keepalive handlers. */
   async connect(): Promise<void> {
     const url = this.buildWsUrl();
@@ -155,6 +249,26 @@ export class CartesiaSTT {
       });
     });
 
+    this.armMessageAndKeepalive();
+  }
+
+  /**
+   * Adopt a pre-opened, already-OPEN WebSocket produced by the prewarm
+   * pipeline (see `Patter.parkProviderConnections`). Skips the fresh
+   * `new WebSocket()` + handshake — the WS is already through DNS, TLS
+   * and HTTP-101 so audio frames can flow on this turn instead of
+   * paying ~150-400 ms of handshake.
+   *
+   * Caller MUST verify `ws.readyState === OPEN` before calling. If the
+   * parked WS died between park and adopt, fall back to `connect()`.
+   */
+  adoptWebSocket(ws: WebSocket): void {
+    this.ws = ws;
+    this.armMessageAndKeepalive();
+  }
+
+  private armMessageAndKeepalive(): void {
+    if (!this.ws) return;
     this.ws.on('message', (raw: WebSocket.RawData) => {
       let event: CartesiaEvent;
       try {
@@ -208,6 +322,32 @@ export class CartesiaSTT {
   sendAudio(audio: Buffer): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(audio);
+  }
+
+  /**
+   * Force Cartesia to finalise the in-flight utterance immediately.
+   *
+   * Sends a ``finalize`` text frame on the live WebSocket. Cartesia
+   * replies with the final transcript followed by ``flush_done``,
+   * bypassing its conservative internal silence heuristic (which can
+   * wait 2-7 s on PSTN audio before naturally finalising). Wired
+   * into ``StreamHandler`` on the VAD ``speech_end`` event so the
+   * SDK's authoritative end-of-speech detection forces an immediate
+   * STT finalisation — turning Cartesia's natural-pause endpointing
+   * into a deterministic VAD-driven one, parity with the Deepgram
+   * fast-path. No-op when the WS isn't open. Parity with Python
+   * ``CartesiaSTT.finalize``.
+   */
+  async finalize(): Promise<void> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    await new Promise<void>((resolve) => {
+      this.ws!.send(CartesiaSTTClientFrame.FINALIZE, (err) => {
+        if (err) {
+          getLogger().debug(`Cartesia finalize send failed: ${String(err)}`);
+        }
+        resolve();
+      });
+    });
   }
 
   /** Register a transcript listener. */
@@ -292,4 +432,28 @@ export class CartesiaSTT {
       });
     }
   }
+}
+
+/**
+ * Render a warmup error for logging without leaking the request URL.
+ *
+ * `String(err)` on a `ws` handshake failure can include the upgrade
+ * URL, which for Cartesia / AssemblyAI carries the API key as a
+ * query-string parameter. This helper extracts only the HTTP status
+ * (when present) or the error class name so the API key never lands
+ * in logs.
+ */
+function describeWarmupError(err: unknown): string {
+  if (typeof err === 'object' && err !== null) {
+    // `ws` handshake failures expose `statusCode` (or `code` on some
+    // versions) when the server returned an HTTP error during upgrade.
+    const e = err as { statusCode?: number; code?: number; name?: string; constructor?: { name?: string } };
+    if (typeof e.statusCode === 'number') return `HTTP ${e.statusCode}`;
+    if (typeof e.code === 'number' && e.code >= 100 && e.code < 600) return `HTTP ${e.code}`;
+    const ctor = e.constructor?.name;
+    if (typeof ctor === 'string' && ctor !== 'Object') return ctor;
+    if (typeof e.name === 'string') return e.name;
+  }
+  // Fallback: log the type, never the full string (which may contain URL).
+  return typeof err;
 }

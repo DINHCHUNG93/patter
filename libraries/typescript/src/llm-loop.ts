@@ -380,6 +380,22 @@ export interface LLMProvider {
     tools?: Array<Record<string, unknown>> | null,
     opts?: LLMStreamOptions,
   ): AsyncGenerator<LLMChunk, void, unknown>;
+  /**
+   * Optional best-effort pre-call DNS / TLS / HTTP-keepalive warmup.
+   *
+   * Called once per outbound call from ``Patter.call`` when the agent has
+   * ``prewarm: true`` (the default). Concrete providers (OpenAI,
+   * Anthropic, Google, Cerebras, Groq) override this to issue a
+   * lightweight HTTPS GET to their inference endpoint so by the time the
+   * first ``stream()`` call lands, the connection pool already has a
+   * warm socket. Failures are logged at debug level and never abort the
+   * call — pure latency optimisation.
+   *
+   * Optional on the interface (``warmup?: ...``) so providers without a
+   * warmup hook still satisfy the type. Detected via runtime
+   * ``typeof provider.warmup === 'function'`` in the client.
+   */
+  warmup?(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +428,8 @@ export interface OpenAILLMSamplingOptions {
 
 /** LLM provider backed by OpenAI Chat Completions (streaming). */
 export class OpenAILLMProvider implements LLMProvider {
+  /** Stable pricing/dashboard key — read by stream-handler/metrics. */
+  static readonly providerKey = 'openai';
   private readonly apiKey: string;
   readonly model: string;
   private readonly temperature?: number;
@@ -438,6 +456,37 @@ export class OpenAILLMProvider implements LLMProvider {
     this.frequencyPenalty = sampling.frequencyPenalty;
     this.presencePenalty = sampling.presencePenalty;
     this.stop = sampling.stop;
+  }
+
+  /** Subclasses (Cerebras, Groq) override this with their own host. */
+  protected get baseUrl(): string {
+    return 'https://api.openai.com/v1';
+  }
+
+  /**
+   * Pre-call DNS / TLS / HTTP-keepalive warmup.
+   *
+   * Issues a lightweight ``GET ${baseUrl}/models`` so DNS, TLS and HTTP/2
+   * are already up by the time the first ``chat.completions`` call lands.
+   * Best-effort: 5 s timeout, all exceptions swallowed at debug level.
+   *
+   * Note: an HTTPS GET warms DNS + TLS + connection pool but does NOT
+   * warm the inference path itself; for true inference warmup a real
+   * low-token request is needed, left as a follow-up. STT / TTS providers ship concrete
+   * WebSocket-based prewarms (Cartesia / Deepgram / AssemblyAI for STT;
+   * ElevenLabs WS for TTS) which save 200-500 ms each — those dominate
+   * the cold-start latency budget.
+   */
+  async warmup(): Promise<void> {
+    try {
+      await fetch(`${this.baseUrl}/models`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch (err) {
+      getLogger().debug(`LLM warmup failed (best-effort): ${String(err)}`);
+    }
   }
 
   /** Stream OpenAI Chat Completions chunks for the given messages/tools. */
@@ -626,6 +675,11 @@ export class LLMLoop {
   // Fix 10: track provider/model so usage chunks can be attributed for billing.
   private readonly _providerName: string;
   private readonly _modelName: string;
+  // Diagnostics for the char/4 fallback billing path (see iterate loop).
+  // Counted per-LLMLoop instance (i.e. per call). Surfaced only via logs
+  // — keeps recordLlmUsage's public signature unchanged. Parity with Python.
+  private _usageMissingCount = 0;
+  private _loggedUsageFallback = false;
   // Optional async observer fired after a successful tool execution so
   // the host SDK (StreamHandler in pipeline mode) can surface tool calls
   // into the transcript timeline / `onTranscript` callback. Mirrors the
@@ -772,6 +826,7 @@ export class LLMLoop {
       const toolCallsAccumulated = new Map<number, ToolCallAccumulator>();
       const textParts: string[] = [];
       let hasToolCalls = false;
+      let usageChunkReceived = false;
 
       for await (const chunk of this.provider.stream(messages, this.openaiTools, opts)) {
         if (chunk.type === 'text' && chunk.content) {
@@ -788,6 +843,7 @@ export class LLMLoop {
           }
         } else if (chunk.type === 'usage') {
           // Fix 10: forward token usage to the metrics accumulator for billing.
+          usageChunkReceived = true;
           metrics?.recordLlmUsage(
             this._providerName,
             this._modelName,
@@ -812,6 +868,53 @@ export class LLMLoop {
           if (chunk.id) acc.id = chunk.id;
           if (chunk.name) acc.name = chunk.name;
           if (chunk.arguments) acc.arguments += chunk.arguments;
+        }
+      }
+
+      // Fallback billing: some providers (Cerebras streaming has been
+      // observed to do this on certain chunk-shape variants) don't emit
+      // a ``usage`` chunk even with ``stream_options: { include_usage: true }``.
+      // Without this fallback the LLM cost silently shows ~0 for the
+      // whole call. char/4 is the canonical OpenAI-tokenizer rough estimate;
+      // conservative-upward is preferable to silent zero. Parity with Python.
+      if (!usageChunkReceived && metrics) {
+        let inputChars = 0;
+        for (const m of messages) {
+          const c = (m as { content?: unknown }).content;
+          if (typeof c === 'string') inputChars += c.length;
+        }
+        const outputChars = textParts.reduce((s, p) => s + p.length, 0);
+        const estimatedInput = Math.max(1, Math.floor(inputChars / 4));
+        const estimatedOutput = Math.max(1, Math.floor(outputChars / 4));
+        metrics.recordLlmUsage(
+          this._providerName,
+          this._modelName,
+          estimatedInput,
+          estimatedOutput,
+          0,
+          0,
+        );
+        this._usageMissingCount += 1;
+        // First fallback in this call → INFO so the operator sees it once.
+        // Subsequent iterations only DEBUG to avoid spamming logs on long
+        // tool-loop turns where every iteration is char/4-billed. Parity Py.
+        if (!this._loggedUsageFallback) {
+          this._loggedUsageFallback = true;
+          getLogger().info(
+            `llm_usage_fallback provider=${this._providerName} ` +
+              `model=${this._modelName} input_chars=${inputChars} ` +
+              `output_chars=${outputChars} est_input_tokens=${estimatedInput} ` +
+              `est_output_tokens=${estimatedOutput}`,
+          );
+        } else {
+          getLogger().debug(
+            `llm_usage_fallback provider=${this._providerName} ` +
+              `model=${this._modelName} iteration=${iter} ` +
+              `input_chars=${inputChars} output_chars=${outputChars} ` +
+              `est_input_tokens=${estimatedInput} ` +
+              `est_output_tokens=${estimatedOutput} ` +
+              `total_missing=${this._usageMissingCount}`,
+          );
         }
       }
 

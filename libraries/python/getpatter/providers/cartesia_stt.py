@@ -12,7 +12,7 @@ import json
 import logging
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
-from typing import AsyncIterator, Literal
+from typing import ClassVar, AsyncIterator, Literal
 from urllib.parse import urlencode
 
 import aiohttp
@@ -103,6 +103,9 @@ class CartesiaSTT(STTProvider):
             kwargs when both are provided.
     """
 
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "cartesia_stt"
+
     def __init__(
         self,
         api_key: str,
@@ -136,6 +139,36 @@ class CartesiaSTT(STTProvider):
         self._transcript_queue: asyncio.Queue[Transcript] = asyncio.Queue()
         self._running = False
         self.request_id: str | None = None
+        self._audio_bytes_sent: int = 0
+
+    @property
+    def sample_rate(self) -> int:
+        return self._opts.sample_rate
+
+    @property
+    def encoding(self) -> str:
+        # Cartesia STT only accepts pcm_s16le today; surface a stable
+        # observability label that maps to "linear16" semantics.
+        return "linear16" if self._opts.encoding == "pcm_s16le" else self._opts.encoding
+
+    def _record_transcript_cost(self) -> None:
+        """Emit ``patter.cost.stt_seconds`` for buffered audio."""
+        try:
+            from getpatter.observability.attributes import record_patter_attrs
+
+            bytes_per_sample = 1 if self.encoding == "mulaw" else 2
+            seconds = self._audio_bytes_sent / float(
+                self.sample_rate * bytes_per_sample
+            )
+            record_patter_attrs(
+                {
+                    "patter.cost.stt_seconds": seconds,
+                    "patter.stt.provider": "cartesia",
+                }
+            )
+            self._audio_bytes_sent = 0
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("_record_transcript_cost failed", exc_info=True)
 
     def __repr__(self) -> str:
         return (
@@ -168,6 +201,61 @@ class CartesiaSTT(STTProvider):
             params["language"] = self._opts.language
         return f"{base}/stt/websocket?{urlencode(params)}"
 
+    async def warmup(self) -> None:
+        """Pre-call WebSocket warmup for the Cartesia STT ``/stt/websocket`` endpoint.
+
+        Opens the WS (DNS + TLS + auth handshake), idles ~250 ms so the
+        Cartesia edge keeps session state warm, then closes. By the time
+        :meth:`connect` is invoked at call-pickup the resolver and TLS
+        session are hot — net wire time saving of 200-500 ms.
+
+        Billing safety: Cartesia STT bills on streamed audio seconds (per
+        https://docs.cartesia.ai/2025-04-16/api-reference/stt/stt). Opening
+        + closing the WebSocket without forwarding audio does not consume
+        billable seconds. Best-effort: failures are logged at DEBUG.
+        """
+        ws_url = self._build_ws_url()
+        headers = {"User-Agent": USER_AGENT}
+        session: aiohttp.ClientSession | None = None
+        ws: aiohttp.ClientWebSocketResponse | None = None
+        try:
+            session = aiohttp.ClientSession()
+            ws = await asyncio.wait_for(
+                session.ws_connect(ws_url, headers=headers),
+                timeout=5.0,
+            )
+            # Idle briefly so the provider edge keeps session state warm.
+            await asyncio.sleep(0.25)
+        except aiohttp.WSServerHandshakeError as exc:
+            # IMPORTANT: ``str(exc)`` includes the request URL, which
+            # carries the API key as a query-string parameter (Cartesia
+            # auth pattern). Log only the HTTP status so the API key
+            # never lands in logs.
+            logger.debug(
+                "Cartesia STT warmup failed (best-effort): HTTP %d", exc.status
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            # The API key only travels in the URL, which only
+            # ``WSServerHandshakeError`` exposes in ``str(exc)``. For
+            # everything else (DNS, TCP, TLS, timeout) the exception
+            # type alone is informative enough — and crucially never
+            # leaks the URL.
+            logger.debug(
+                "Cartesia STT warmup failed (best-effort): %s",
+                type(exc).__name__,
+            )
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+
     async def connect(self) -> None:
         """Open the WebSocket and start recv + keepalive tasks."""
         if self._session is None:
@@ -176,6 +264,66 @@ class CartesiaSTT(STTProvider):
         ws_url = self._build_ws_url()
         headers = {"User-Agent": USER_AGENT}
         self._ws = await self._session.ws_connect(ws_url, headers=headers)
+        self._arm_recv_and_keepalive()
+
+    async def open_parked_connection(
+        self,
+    ) -> tuple[aiohttp.ClientSession, aiohttp.ClientWebSocketResponse]:
+        """Open a fresh WebSocket and return the session + WS without
+        arming any recv / keepalive task.
+
+        Used by :meth:`Patter._park_provider_connections` to park a
+        Cartesia STT WS during the carrier ringing window so the per-call
+        :class:`StreamHandler` can adopt it via :meth:`adopt_websocket`
+        and skip the cold TLS + WS-upgrade handshake on the first turn.
+
+        Billing safety: opening + parking the WS does not stream audio
+        (Cartesia STT bills on streamed audio seconds), so no charge is
+        incurred. Caller is responsible for closing both the WS and the
+        session if the parked handle is never adopted.
+        """
+        session = aiohttp.ClientSession()
+        try:
+            ws_url = self._build_ws_url()
+            headers = {"User-Agent": USER_AGENT}
+            ws = await asyncio.wait_for(
+                session.ws_connect(ws_url, headers=headers), timeout=10.0
+            )
+        except Exception:
+            await session.close()
+            raise
+        return session, ws
+
+    def adopt_websocket(
+        self,
+        session: aiohttp.ClientSession,
+        ws: aiohttp.ClientWebSocketResponse,
+    ) -> None:
+        """Adopt a pre-opened, already-OPEN WebSocket parked by
+        :meth:`open_parked_connection`. Skips the fresh WS handshake —
+        audio frames can flow on the first turn instead of paying the
+        ~150-400 ms TLS + WS-upgrade round-trip.
+
+        Caller MUST verify the WS is still alive (``not ws.closed``)
+        before calling. If the parked WS died between park and adopt,
+        fall back to :meth:`connect`.
+        """
+        if self._session is None:
+            self._session = session
+        else:
+            # Different session was already created (caller error /
+            # connect was raced) — close the parked session to avoid
+            # a leak.
+            asyncio.create_task(session.close())
+        self._ws = ws
+        self._arm_recv_and_keepalive()
+
+    def _arm_recv_and_keepalive(self) -> None:
+        """Start the receive + keepalive tasks against ``self._ws``.
+
+        Shared between :meth:`connect` and :meth:`adopt_websocket` so
+        the two paths produce byte-identical session state.
+        """
         self._running = True
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
@@ -184,7 +332,28 @@ class CartesiaSTT(STTProvider):
         """Forward a PCM s16le audio chunk to Cartesia."""
         if self._ws is None or self._ws.closed:
             raise RuntimeError("Not connected. Call connect() first.")
+        self._audio_bytes_sent += len(audio_chunk)
         await self._ws.send_bytes(audio_chunk)
+
+    async def finalize(self) -> None:
+        """Force Cartesia to finalise the in-flight utterance immediately.
+
+        Sends a ``finalize`` text frame on the live WebSocket. Cartesia
+        replies with the final transcript followed by ``flush_done``,
+        bypassing its conservative internal silence heuristic (which can
+        wait 2-7 s on PSTN audio before naturally finalising). Wired
+        into :meth:`StreamHandler` on the VAD ``speech_end`` event so
+        the SDK's authoritative end-of-speech detection forces an
+        immediate STT finalisation — turning Cartesia's natural-pause
+        endpointing into a deterministic VAD-driven one, parity with
+        the Deepgram fast-path. No-op when the WS isn't open.
+        """
+        if self._ws is None or self._ws.closed:
+            return
+        try:
+            await self._ws.send_str(CartesiaSTTClientFrame.FINALIZE.value)
+        except Exception as exc:  # noqa: BLE001 — defensive on a remote socket
+            logger.debug("Cartesia finalize send failed: %s", exc)
 
     async def receive_transcripts(self) -> AsyncIterator[Transcript]:
         """Async generator yielding :class:`Transcript` events as they arrive."""
@@ -195,6 +364,8 @@ class CartesiaSTT(STTProvider):
                 )
             except asyncio.TimeoutError:
                 continue
+            if transcript.is_final:
+                self._record_transcript_cost()
             yield transcript
 
     async def _keepalive_loop(self) -> None:

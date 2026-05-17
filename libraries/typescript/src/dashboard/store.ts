@@ -47,6 +47,19 @@ export class MetricsStore extends EventEmitter {
   private readonly maxCalls: number;
   private calls: CallRecord[] = [];
   private activeCalls: Map<string, CallRecord> = new Map();
+  /**
+   * User-driven soft delete: call_ids the operator removed from the
+   * dashboard view. The on-disk artefacts written by ``CallLogger``
+   * (``metadata.json``, ``transcript.jsonl``) are intentionally NOT
+   * touched — they serve as the durable backup. All read paths
+   * (``getCalls`` / ``getCall`` / ``getAggregates`` / ``getCallsInRange``
+   * / ``hydrate``) filter against this set so the call is invisible
+   * to the UI and excluded from rolling metrics. Populated from
+   * ``<logRoot>/.deleted_call_ids.json`` on hydrate so deletions
+   * survive a process restart. Parity with Python.
+   */
+  private deletedCallIds: Set<string> = new Set();
+  private deletedIdsPath: string | null = null;
 
   /**
    * Accepts either a numeric ``maxCalls`` (legacy positional — matches the
@@ -143,6 +156,18 @@ export class MetricsStore extends EventEmitter {
       active.status = status;
       Object.assign(active, extra);
       if (TERMINAL.has(status)) {
+        // Preserve the running transcript and per-turn metrics accumulated
+        // on the active record. Without this, a Twilio statusCallback that
+        // arrives before the WS ``stop`` frame (and before
+        // ``recordCallEnd``) would create a placeholder entry with no
+        // transcript and no turns — and any dashboard fetch in that race
+        // window would render the live-transcript pane blank. See BUG 2.
+        //
+        // TODO(0.6.2): updateCallStatus writes synthetic records with
+        // metrics:undefined when status callbacks arrive before
+        // recordCallEnd. The dashboard masks this via mergeCallPreserving
+        // (useDashboardData.ts) but the root cause is here — recordCallEnd
+        // should be the only writer to the completed buffer.
         const entry: CallRecord = {
           call_id: callId,
           caller: active.caller || '',
@@ -152,6 +177,12 @@ export class MetricsStore extends EventEmitter {
           ended_at: Date.now() / 1000,
           status,
           metrics: null,
+          ...(active.turns && active.turns.length > 0
+            ? { turns: active.turns }
+            : {}),
+          ...(active.transcript && active.transcript.length > 0
+            ? { transcript: active.transcript }
+            : {}),
           ...extra,
         };
         this.activeCalls.delete(callId);
@@ -182,6 +213,42 @@ export class MetricsStore extends EventEmitter {
     if (active) {
       if (!active.turns) active.turns = [];
       active.turns.push(turn);
+
+      // Mirror each completed round-trip into a flat ``transcript`` array on
+      // the active record so the live-transcript pane (``useTranscript`` in
+      // the SPA, primary mapper path) sees an accumulating ``user → assistant
+      // → user → assistant → …`` history without depending on the
+      // ``TurnMetrics`` shape. The previous implementation only populated
+      // ``active.turns`` (the metrics shape) and the SPA's fallback path
+      // re-derived a transcript from it — but any consumer that read
+      // ``record.transcript`` first (the canonical shape used by completed
+      // calls) saw an empty array, so the live pane could blank between
+      // round-trips. Mirroring keeps the two paths in sync. See dashboard
+      // BUG 1.
+      if (!active.transcript) active.transcript = [];
+      const turnRecord = turn as {
+        user_text?: unknown;
+        agent_text?: unknown;
+        timestamp?: unknown;
+      };
+      const userText =
+        typeof turnRecord.user_text === 'string' ? turnRecord.user_text : '';
+      const agentText =
+        typeof turnRecord.agent_text === 'string' ? turnRecord.agent_text : '';
+      const ts =
+        typeof turnRecord.timestamp === 'number'
+          ? turnRecord.timestamp
+          : Date.now() / 1000;
+      if (userText.length > 0) {
+        active.transcript.push({ role: 'user', text: userText, timestamp: ts });
+      }
+      if (agentText.length > 0 && agentText !== '[interrupted]') {
+        active.transcript.push({
+          role: 'assistant',
+          text: agentText,
+          timestamp: ts,
+        });
+      }
     }
 
     this.publish('turn_complete', { call_id: callId, turn: turn as Record<string, unknown> });
@@ -195,27 +262,89 @@ export class MetricsStore extends EventEmitter {
     const active = this.activeCalls.get(callId);
     this.activeCalls.delete(callId);
 
+    // The Twilio ``statusCallback`` for ``CallStatus=completed`` arrives
+    // shortly before the WS ``stop`` frame and runs ``updateCallStatus``,
+    // which already moved the row from ``activeCalls`` into ``calls[]``.
+    // By the time ``recordCallEnd`` runs the active record is gone and the
+    // completed entry already exists. Without this lookup we'd push a
+    // second row with ``started_at=0`` (no active to copy from) and empty
+    // caller/callee — which is then ranked first by ``getCalls`` (newest
+    // wins) and the older, well-formed row gets shadowed. End result: the
+    // call disappears from the dashboard's 24 h window. See dashboard
+    // BUG C.
+    let existingIdx = -1;
+    if (active === undefined) {
+      for (let i = this.calls.length - 1; i >= 0; i--) {
+        if (this.calls[i].call_id === callId) {
+          existingIdx = i;
+          break;
+        }
+      }
+    }
+    const existing = existingIdx >= 0 ? this.calls[existingIdx] : undefined;
+
     // Preserve explicit status set by a statusCallback during the call
     // (e.g. "no-answer" from Twilio) — fall back to "completed" when the
     // row was still showing the normal "in-progress" state at hang-up.
-    const activeStatus = active?.status;
+    const priorStatus = active?.status ?? existing?.status;
     const resolvedStatus =
-      activeStatus && activeStatus !== 'in-progress' ? activeStatus : 'completed';
+      priorStatus && priorStatus !== 'in-progress' ? priorStatus : 'completed';
+    // Resolve the final transcript and turns. ``data.transcript`` from the
+    // SDK is the authoritative ``history.entries`` snapshot at hang-up; when
+    // it's missing or empty (e.g. webhook-rejected inbound, or the active
+    // record was already moved to ``calls[]`` by an earlier statusCallback
+    // and the data payload doesn't carry one), fall back to the running
+    // transcript we accumulated on the active record via ``recordTurn``.
+    // This keeps the live-transcript pane stable across the call_status
+    // (``completed``) → call_end gap. See dashboard BUG 2.
+    const dataTranscript = data.transcript as CallRecord['transcript'];
+    const resolvedTranscript: CallRecord['transcript'] =
+      dataTranscript && dataTranscript.length > 0
+        ? dataTranscript
+        : active?.transcript && active.transcript.length > 0
+          ? active.transcript
+          : existing?.transcript && existing.transcript.length > 0
+            ? existing.transcript
+            : [];
+    const resolvedTurns: unknown[] | undefined =
+      active?.turns && active.turns.length > 0
+        ? active.turns
+        : existing?.turns && existing.turns.length > 0
+          ? existing.turns
+          : undefined;
     const entry: CallRecord = {
       call_id: callId,
-      caller: (data.caller as string) || active?.caller || '',
-      callee: (data.callee as string) || active?.callee || '',
-      direction: active?.direction || (data.direction as string) || 'inbound',
-      started_at: active?.started_at || 0,
+      caller:
+        (data.caller as string) ||
+        active?.caller ||
+        existing?.caller ||
+        '',
+      callee:
+        (data.callee as string) ||
+        active?.callee ||
+        existing?.callee ||
+        '',
+      direction:
+        active?.direction ||
+        existing?.direction ||
+        (data.direction as string) ||
+        'inbound',
+      started_at: active?.started_at || existing?.started_at || 0,
       ended_at: Date.now() / 1000,
-      transcript: (data.transcript as CallRecord['transcript']) || [],
+      transcript: resolvedTranscript,
+      ...(resolvedTurns ? { turns: resolvedTurns } : {}),
       status: resolvedStatus,
-      metrics: metrics ?? null,
+      metrics: metrics ?? existing?.metrics ?? null,
     };
 
-    this.calls.push(entry);
-    if (this.calls.length > this.maxCalls) {
-      this.calls = this.calls.slice(-this.maxCalls);
+    if (existingIdx >= 0) {
+      // Update in place so the buffer doesn't grow a duplicate row.
+      this.calls[existingIdx] = entry;
+    } else {
+      this.calls.push(entry);
+      if (this.calls.length > this.maxCalls) {
+        this.calls = this.calls.slice(-this.maxCalls);
+      }
     }
 
     this.publish('call_end', {
@@ -224,18 +353,104 @@ export class MetricsStore extends EventEmitter {
     });
   }
 
-  /** Return a window of completed calls in newest-first order. */
+  /**
+   * Return a window of completed calls in newest-first order.
+   *
+   * Soft-deleted call_ids (see ``deleteCalls``) are filtered out so the
+   * dashboard never re-shows a row the user removed. The on-disk
+   * artefacts are intentionally preserved as a backup.
+   */
   getCalls(limit = 50, offset = 0): CallRecord[] {
-    const ordered = [...this.calls].reverse();
+    const visible = this.calls.filter((c) => !this.deletedCallIds.has(c.call_id));
+    const ordered = visible.reverse();
     return ordered.slice(offset, offset + limit);
   }
 
-  /** Look up a completed call by id (newest match wins). */
+  /**
+   * Look up a completed call by id (newest match wins).
+   *
+   * Soft-deleted call_ids resolve to ``null`` so the SPA's detail pane
+   * cannot render a row the user removed.
+   */
   getCall(callId: string): CallRecord | null {
+    if (this.deletedCallIds.has(callId)) return null;
     for (let i = this.calls.length - 1; i >= 0; i--) {
       if (this.calls[i].call_id === callId) return this.calls[i];
     }
     return null;
+  }
+
+  /**
+   * Soft-delete one or more calls from the dashboard view.
+   *
+   * Adds each ``call_id`` to an in-memory set. Subsequent reads via
+   * ``getCalls`` / ``getCall`` / ``getAggregates`` / ``getCallsInRange``
+   * exclude the deleted ids, so rolling metrics (avg latency, total
+   * spend) are recomputed without them. The on-disk
+   * ``metadata.json`` / ``transcript.jsonl`` files written by
+   * ``CallLogger`` are NOT touched — they serve as a durable backup
+   * the operator can audit outside the dashboard.
+   *
+   * Active calls are never deletable. A call_id that is currently
+   * in ``activeCalls`` is silently skipped so a mid-call delete
+   * from the UI cannot orphan the live transcript pane.
+   *
+   * Persisted to ``<logRoot>/.deleted_call_ids.json`` (best-effort)
+   * when ``hydrate()`` has been called with a log root. Parity with
+   * Python ``delete_calls``.
+   *
+   * @returns The list of call_ids actually accepted as deleted.
+   */
+  deleteCalls(callIds: readonly string[]): string[] {
+    const ids = new Set<string>();
+    for (const cid of callIds || []) {
+      if (typeof cid === 'string' && cid && !this.activeCalls.has(cid)) {
+        ids.add(cid);
+      }
+    }
+    if (ids.size === 0) return [];
+    const accepted: string[] = [];
+    for (const cid of ids) {
+      if (!this.deletedCallIds.has(cid)) {
+        this.deletedCallIds.add(cid);
+        accepted.push(cid);
+      }
+    }
+    if (accepted.length === 0) return [];
+    accepted.sort();
+    this.persistDeletedIds();
+    this.publish('calls_deleted', { call_ids: accepted });
+    return accepted;
+  }
+
+  /** Whether ``callId`` was soft-deleted from the dashboard. */
+  isDeleted(callId: string): boolean {
+    return this.deletedCallIds.has(callId);
+  }
+
+  /** Snapshot of soft-deleted call_ids (sorted). */
+  getDeletedCallIds(): string[] {
+    return Array.from(this.deletedCallIds).sort();
+  }
+
+  /** Atomically persist the deleted-ids set to disk. Best-effort. */
+  private persistDeletedIds(): void {
+    if (this.deletedIdsPath === null) return;
+    try {
+      const dir = path.dirname(this.deletedIdsPath);
+      fs.mkdirSync(dir, { recursive: true });
+      const tmp = this.deletedIdsPath + '.tmp';
+      const payload = {
+        version: 1,
+        deleted_call_ids: Array.from(this.deletedCallIds).sort(),
+      };
+      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      fs.renameSync(tmp, this.deletedIdsPath);
+    } catch (err) {
+      getLogger().debug(
+        `MetricsStore.persistDeletedIds: ${String(err)}`,
+      );
+    }
   }
 
   /** Look up an active call by id (returns undefined if not active or unknown). */
@@ -248,9 +463,17 @@ export class MetricsStore extends EventEmitter {
     return Array.from(this.activeCalls.values());
   }
 
-  /** Compute summary statistics across the buffered call history. */
+  /**
+   * Compute summary statistics across the buffered call history.
+   *
+   * Soft-deleted calls are excluded so rolling metrics (avg latency,
+   * total spend) match exactly what the operator sees in the call list.
+   */
   getAggregates(): Record<string, unknown> {
-    const totalCalls = this.calls.length;
+    const visible = this.calls.filter(
+      (c) => !this.deletedCallIds.has(c.call_id),
+    );
+    const totalCalls = visible.length;
     if (totalCalls === 0) {
       return {
         total_calls: 0,
@@ -271,7 +494,7 @@ export class MetricsStore extends EventEmitter {
     let costLlm = 0;
     let costTel = 0;
 
-    for (const call of this.calls) {
+    for (const call of visible) {
       const m = call.metrics as Record<string, unknown> | null;
       if (!m) continue;
       const cost = (m.cost as Record<string, number>) || {};
@@ -282,7 +505,10 @@ export class MetricsStore extends EventEmitter {
       costTel += cost.telephony || 0;
       totalDuration += (m.duration_seconds as number) || 0;
       const avgLat = (m.latency_avg as Record<string, number>) || {};
-      const tMs = avgLat.total_ms || 0;
+      // Prefer the user-perceived wait time (agent_response_ms) — falls
+      // back to round-trip total_ms only when the SDK didn't record the
+      // breakdown (legacy hydrate path).
+      const tMs = avgLat.agent_response_ms || avgLat.total_ms || 0;
       if (tMs > 0) {
         totalLatency += tMs;
         latencyCount++;
@@ -306,9 +532,13 @@ export class MetricsStore extends EventEmitter {
     };
   }
 
-  /** Return calls whose `started_at` falls within `[fromTs, toTs]` (Unix seconds). */
+  /**
+   * Return calls whose `started_at` falls within `[fromTs, toTs]` (Unix
+   * seconds). Soft-deleted calls are filtered out.
+   */
   getCallsInRange(fromTs = 0, toTs = 0): CallRecord[] {
     return this.calls.filter((call) => {
+      if (this.deletedCallIds.has(call.call_id)) return false;
       const started = call.started_at || 0;
       if (fromTs && started < fromTs) return false;
       if (toTs && started > toTs) return false;
@@ -316,9 +546,13 @@ export class MetricsStore extends EventEmitter {
     });
   }
 
-  /** Number of completed calls currently in the ring buffer. */
+  /** Number of completed (non-deleted) calls currently in the ring buffer. */
   get callCount(): number {
-    return this.calls.length;
+    let n = 0;
+    for (const c of this.calls) {
+      if (!this.deletedCallIds.has(c.call_id)) n++;
+    }
+    return n;
   }
 
   /**
@@ -333,6 +567,32 @@ export class MetricsStore extends EventEmitter {
    */
   hydrate(logRoot: string | null | undefined): number {
     if (!logRoot) return 0;
+
+    // Wire the deleted-ids persistence path FIRST so any subsequent
+    // ``deleteCalls`` call (even before history hydrates) lands in the
+    // right file. Restore the set from disk so deletions survive a
+    // process restart.
+    const deletedIdsPath = path.join(logRoot, '.deleted_call_ids.json');
+    this.deletedIdsPath = deletedIdsPath;
+    if (fs.existsSync(deletedIdsPath)) {
+      try {
+        const raw = fs.readFileSync(deletedIdsPath, 'utf8');
+        const payload = JSON.parse(raw) as { deleted_call_ids?: unknown };
+        const arr = Array.isArray(payload.deleted_call_ids)
+          ? (payload.deleted_call_ids as unknown[])
+          : [];
+        for (const cid of arr) {
+          if (typeof cid === 'string' && cid.length > 0) {
+            this.deletedCallIds.add(cid);
+          }
+        }
+      } catch (err) {
+        getLogger().debug(
+          `MetricsStore.hydrate: skipping ${deletedIdsPath}: ${String(err)}`,
+        );
+      }
+    }
+
     const callsRoot = path.join(logRoot, 'calls');
     if (!fs.existsSync(callsRoot)) return 0;
 
@@ -374,6 +634,19 @@ export class MetricsStore extends EventEmitter {
             );
             continue;
           }
+          // CallLogger writes the transcript to a separate ``transcript.jsonl``
+          // file (one turn per line) — ``metadata.json`` only carries a turn
+          // count. Without this fallback, hydrated past calls render with an
+          // empty transcript pane: the SPA polls /api/dashboard/calls/:id,
+          // the route serves the hydrated record verbatim, and ``transcript``
+          // is ``[]``. Read the sibling file and synthesise the entry list
+          // the SPA expects so the pane populates on click.
+          if (!record.transcript || record.transcript.length === 0) {
+            const fromJsonl = loadTranscriptJsonl(
+              path.join(childPath, 'transcript.jsonl'),
+            );
+            if (fromJsonl.length > 0) record.transcript = fromJsonl;
+          }
           collected.push(record);
           seen.add(callId);
         } catch (err) {
@@ -405,6 +678,63 @@ export class MetricsStore extends EventEmitter {
 }
 
 /**
+ * Build a ``metrics`` object from top-level CallLogger fields. ``CallLogger``
+ * writes ``cost`` / ``latency`` / ``duration_ms`` / ``telephony_provider`` at
+ * the top of ``metadata.json``, but the dashboard UI reads them from
+ * ``metrics``. Without this fallback every hydrated call shows ``$0.00`` and
+ * ``—`` for cost and latency.
+ */
+function metricsFromTopLevel(
+  meta: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const cost =
+    meta.cost && typeof meta.cost === 'object'
+      ? (meta.cost as Record<string, unknown>)
+      : null;
+  const latency =
+    meta.latency && typeof meta.latency === 'object'
+      ? (meta.latency as Record<string, unknown>)
+      : null;
+  const durationMs = meta.duration_ms;
+  const telephony = meta.telephony_provider;
+  if (cost === null && latency === null && durationMs == null && !telephony) {
+    return null;
+  }
+  const out: Record<string, unknown> = {};
+  if (cost !== null) out.cost = cost;
+  if (latency !== null) {
+    // Prefer the full LatencyBreakdown objects (avg/p50/p95/p99) when the
+    // server persisted them. Old metadata.json files only carry flat
+    // ``p50_ms/p95_ms/p99_ms`` totals — synthesize a minimal latency_avg
+    // from those so the table still shows a number, but no breakdown is
+    // available for those historical rows.
+    const fullAvg = latency.avg && typeof latency.avg === 'object' ? (latency.avg as Record<string, unknown>) : null;
+    const fullP50 = latency.p50 && typeof latency.p50 === 'object' ? (latency.p50 as Record<string, unknown>) : null;
+    const fullP95 = latency.p95 && typeof latency.p95 === 'object' ? (latency.p95 as Record<string, unknown>) : null;
+    const fullP99 = latency.p99 && typeof latency.p99 === 'object' ? (latency.p99 as Record<string, unknown>) : null;
+    if (fullAvg) out.latency_avg = fullAvg;
+    if (fullP50) out.latency_p50 = fullP50;
+    if (fullP95) out.latency_p95 = fullP95;
+    if (fullP99) out.latency_p99 = fullP99;
+    if (!fullAvg && !fullP50 && !fullP95) {
+      const totalMs =
+        (typeof latency.p95_ms === 'number' && latency.p95_ms) ||
+        (typeof latency.p50_ms === 'number' && latency.p50_ms) ||
+        0;
+      out.latency_avg = { total_ms: totalMs };
+    }
+    out.latency = latency;
+  }
+  if (typeof durationMs === 'number' && durationMs > 0) {
+    out.duration_seconds = durationMs / 1000;
+  }
+  if (typeof telephony === 'string' && telephony) {
+    out.telephony_provider = telephony;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/**
  * Translate a CallLogger ``metadata.json`` payload into a ``CallRecord``.
  * Returns ``null`` when ``started_at`` is missing or unparseable — the record
  * would otherwise be silently inserted with ``started_at = 0`` (Unix epoch),
@@ -421,7 +751,7 @@ function metadataToCallRecord(
   const metrics =
     meta.metrics && typeof meta.metrics === 'object'
       ? (meta.metrics as Record<string, unknown>)
-      : null;
+      : metricsFromTopLevel(meta);
   const transcript = Array.isArray(meta.transcript)
     ? (meta.transcript as CallRecord['transcript'])
     : [];
@@ -436,6 +766,54 @@ function metadataToCallRecord(
     metrics,
     transcript,
   };
+}
+
+/**
+ * Reconstruct the dashboard ``transcript`` array from a CallLogger
+ * ``transcript.jsonl`` file. Each line is a turn record carrying
+ * ``user_text`` / ``agent_text`` / ``ts`` (ISO-8601). We expand each
+ * non-empty side into a separate ``{role, text, timestamp}`` entry so the
+ * SPA's ``toUiTranscript`` mapper can render them in order. Returns an
+ * empty array on any IO/parse failure — hydrate is best-effort and a
+ * malformed transcript file should not block the call row from showing.
+ */
+function loadTranscriptJsonl(
+  filePath: string,
+): NonNullable<CallRecord['transcript']> {
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const lines = raw.split('\n').filter((l) => l.trim().length > 0);
+    const out: NonNullable<CallRecord['transcript']> = [];
+    for (const line of lines) {
+      let row: Record<string, unknown>;
+      try {
+        row = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const tsIso = typeof row.ts === 'string' ? Date.parse(row.ts) : NaN;
+      const tsNumeric =
+        typeof row.timestamp === 'number' ? row.timestamp * 1000 : NaN;
+      const timestamp = Number.isFinite(tsIso)
+        ? tsIso
+        : Number.isFinite(tsNumeric)
+          ? tsNumeric
+          : 0;
+      const userText = typeof row.user_text === 'string' ? row.user_text : '';
+      const agentText =
+        typeof row.agent_text === 'string' ? row.agent_text : '';
+      if (userText.length > 0) {
+        out.push({ role: 'user', text: userText, timestamp });
+      }
+      if (agentText.length > 0 && agentText !== '[interrupted]') {
+        out.push({ role: 'assistant', text: agentText, timestamp });
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 /**

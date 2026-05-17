@@ -42,7 +42,12 @@ export function mountDashboard(app: Express, store: MetricsStore, token = ''): v
   });
 
   app.get('/api/dashboard/calls/:callId', auth, (req, res) => {
-    const call = store.getCall(String(req.params.callId));
+    // Fall back to the active record so the live-transcript polling path
+    // (``useTranscript`` in the dashboard SPA) sees turns as they accumulate
+    // during the call. Without this fallback the route 404s while the call
+    // is in flight and the live transcript pane stays empty.
+    const callId = String(req.params.callId);
+    const call = store.getCall(callId) ?? store.getActive(callId);
     if (!call) {
       res.status(404).json({ error: 'Not found' });
       return;
@@ -56,6 +61,37 @@ export function mountDashboard(app: Express, store: MetricsStore, token = ''): v
 
   app.get('/api/dashboard/aggregates', auth, (_req, res) => {
     res.json(store.getAggregates());
+  });
+
+  // --- Soft delete ---
+  //
+  // ``DELETE /api/dashboard/calls/:callId`` removes a single call from the
+  // dashboard view + aggregates. ``POST /api/dashboard/calls/delete`` accepts
+  // a batch ``{ call_ids: [...] }``. Both are idempotent and never touch
+  // the on-disk artefacts — those serve as the durable backup. Active calls
+  // are silently skipped so a mid-call delete cannot orphan the live pane.
+  // Parity with Python.
+
+  app.delete('/api/dashboard/calls/:callId', auth, (req, res) => {
+    const callId = String(req.params.callId);
+    const accepted = store.deleteCalls([callId]);
+    res.json({ deleted: accepted, count: accepted.length });
+  });
+
+  app.post('/api/dashboard/calls/delete', auth, (req, res) => {
+    const body = (req.body ?? {}) as { call_ids?: unknown };
+    const raw = body.call_ids;
+    if (!Array.isArray(raw)) {
+      res
+        .status(400)
+        .json({ error: "Expected JSON body { 'call_ids': [...] }" });
+      return;
+    }
+    const ids = raw.filter(
+      (cid): cid is string => typeof cid === 'string' && cid.length > 0,
+    );
+    const accepted = store.deleteCalls(ids);
+    res.json({ deleted: accepted, count: accepted.length });
   });
 
   // --- SSE endpoint ---
@@ -147,7 +183,11 @@ export function mountApi(app: Express, store: MetricsStore, token = ''): void {
   });
 
   app.get('/api/v1/calls/:callId', auth, (req, res) => {
-    const call = store.getCall(String(req.params.callId));
+    // Same fall-through as ``/api/dashboard/calls/:callId`` — return the
+    // active record while the call is in flight so external integrations
+    // can poll a single endpoint regardless of call state.
+    const callId = String(req.params.callId);
+    const call = store.getCall(callId) ?? store.getActive(callId);
     if (!call) {
       res.status(404).json({ error: 'Call not found' });
       return;

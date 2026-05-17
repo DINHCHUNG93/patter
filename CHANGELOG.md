@@ -1,6 +1,758 @@
-# Changelog
-
 ## Unreleased
+
+## 0.6.1 (2026-05-15)
+
+### Fixed — `OpenAIRealtime2`: audio transcoding for Twilio + outbound chunking + VAD tuning (TypeScript only)
+
+End-to-end audio support for `gpt-realtime-2` over Twilio. The GA endpoint
+nominally accepts `audio/pcmu` (mulaw 8 kHz) in `session.update` but its
+audio engine silently drops mulaw frames — `input_audio_buffer.commit`
+reports *"buffer only has 0.00ms of audio"* even after several seconds
+of valid mulaw appended, so the user's voice never reaches the model and
+the model's response is generated as PCM-24 (regardless of the declared
+output format) — Twilio plays raw PCM bytes interpreted as mulaw and the
+caller hears nothing. Until OpenAI ships native g711 support on the GA
+endpoint (community thread #1380750), we transcode on both directions
+inside `OpenAIRealtime2Adapter`.
+
+**Inbound (Twilio → model).** Override `sendAudio`:
+- Decode mulaw → PCM-16 8 kHz (`mulawToPcm16`).
+- Apply 2× gain to compensate for the reduced dynamic range of the
+  decoded mulaw signal — telephony peaks land around ±8000 in PCM-16,
+  the GA VAD is calibrated against studio audio peaking around ±16-24k.
+- Direct 3× linear-interpolation upsample to 24 kHz with a one-sample
+  carry across chunk boundaries (eliminates the DC step at every 20 ms
+  Twilio frame boundary that previously kept the VAD pinned below
+  threshold).
+- Send `input_audio_buffer.append` with PCM-24 base64.
+- `session.audio.input.format` is set to `{ type: "audio/pcm",
+  rate: 24000 }` to match.
+
+**Outbound (model → Twilio).** Wrap the audio-delta translation:
+- Decode PCM-24 from `response.output_audio.delta`.
+- Resample 24 k → 16 k → 8 k using two chained `StatefulResampler`
+  instances. Direct 24 k → 8 k (one step) is available in
+  `transcoding.ts` but uses only linear interpolation with no
+  anti-alias filter; the two-step chain routes the signal through the
+  16 k → 8 k path which carries a 5-tap FIR anti-alias filter,
+  empirically the only configuration that produced audibly clean
+  speech on the carrier leg.
+- Encode PCM-8 → mulaw 8 kHz.
+- Split the resulting mulaw into 20 ms (160-byte) slices and emit one
+  synthetic `response.audio.delta` event per slice. Twilio's media
+  pipeline expects ~20 ms frames; shipping one ~200-400 ms delta as a
+  single frame stalls the playout scheduler and the caller hears
+  either a silent gap then a burst, or nothing at all if Twilio drops
+  the over-large frame.
+
+**VAD tuning.** GA `server_vad` is too strict by default for
+3×-upsampled telephony-band audio. We lower `threshold: 0.1` (from the
+0.5 default) and raise `silence_duration_ms: 500` so phone-band speech
+reliably triggers `speech_started` / `speech_stopped`.
+
+**Engine wrapper:** `sendFirstMessage` continues to inject explicit
+`output_modalities`, `audio.output.voice` and `reasoning.effort:"minimal"`
+(see prior commit). The first-message audio path now also benefits from
+the outbound transcoding + chunk-splitting changes — `firstMessage`
+plays in the configured voice (`alloy`) at native cadence.
+
+**Visibility bumps.** `OpenAIRealtimeAdapter` had a few more `private`
+fields promoted to `protected` (`ws`, `armHeartbeatAndListener`,
+`options`) so the subclass can install the wire-level shim and reuse
+the parent's message dispatch unchanged.
+
+**Known limitation.** The Twilio user's voice now reaches the GA model
+audibly but the GA `server_vad` is still tuned for studio audio and the
+caller side of the conversation requires a more aggressive workaround
+(custom semantic VAD or carrier-side audio enhancement). Pipeline-mode
+(STT + LLM + TTS) is the recommended production path for Twilio +
+telephony in 0.6.1 until OpenAI ships native g711_ulaw on the GA
+endpoint.
+
+Files: `libraries/typescript/src/providers/openai-realtime-2.ts`,
+`libraries/typescript/src/providers/openai-realtime.ts` (visibility
+bumps only). Python parity remains a follow-up — `OpenAIRealtime2`
+is still TS-only.
+
+### Added — `OpenAIRealtime2` engine for `gpt-realtime-2` on the GA Realtime API (TypeScript only)
+
+The 0.6.1 enum entry for `gpt-realtime-2` advertised parity with the existing
+v1 Realtime adapter ("accepts the same v1 `session.update` wire shape so it
+slots into the existing adapter without protocol changes"). That turned out
+to be wrong: OpenAI promoted `gpt-realtime-2` to the **GA Realtime API**,
+which (a) rejects the legacy `OpenAI-Beta: realtime=v1` header with
+`invalid_model`, (b) requires `session.type === "realtime"` at the root of
+`session.update`, (c) renames `modalities` → `output_modalities`, (d) nests
+audio config under `session.audio.{input,output}` with MIME `type` strings
+(`audio/pcmu`, `audio/pcma`, `audio/pcm`) instead of v1 enums (`g711_ulaw`,
+`g711_alaw`, `pcm16`), and (e) renames the audio-delta event family from
+`response.audio.*` / `response.audio_transcript.*` to
+`response.output_audio.*` / `response.output_audio_transcript.*`. Going
+through the v1 `OpenAIRealtime` engine with `model: "gpt-realtime-2"`
+either timed out at `connect()` or completed the call with zero audio
+forwarded to Twilio/Telnyx (events fell through to the no-op branch of
+the v1 dispatcher).
+
+New `OpenAIRealtime2` engine marker + `OpenAIRealtime2Adapter` subclass:
+
+- **Separate engine marker.** `kind: "openai_realtime_2"`. The legacy
+  `OpenAIRealtime` engine continues to serve `gpt-realtime`,
+  `gpt-realtime-mini`, `gpt-realtime`, `gpt-4o-realtime-preview`, and
+  `gpt-4o-mini-realtime-preview` against the v1-beta endpoint byte-for-byte
+  unchanged; nothing in that path is touched.
+- **`OpenAIRealtime2Adapter` extends `OpenAIRealtimeAdapter`.** Overrides
+  only `connect()` (omits the beta header + sends the GA `session.update`
+  payload) and `sendFirstMessage()` (uses `output_modalities`, re-injects
+  `audio.output.voice` because the GA `response.create` does NOT inherit
+  it from session, and forces `reasoning: { effort: "minimal" }` for the
+  literal "say exactly X" greeting so TTFB is bounded by audio generation
+  rather than the session-level reasoning tier). Everything else
+  (`sendAudio`, `cancelResponse`, `sendText`, `sendFunctionResult`,
+  heartbeat) is inherited unchanged.
+- **WS-level event translation shim.** Wraps `ws.emit` to rewrite the
+  incoming `type` field for the renamed events
+  (`response.output_audio.{delta,done}` →
+  `response.audio.{delta,done}`; same for `output_audio_transcript`)
+  before the parent dispatcher sees the frame. Payloads are byte-identical
+  so no further changes are needed in `StreamHandler`, metrics, or the
+  dashboard.
+
+Selection becomes opt-in: `phone.agent({ engine: new OpenAIRealtime2({ reasoningEffort: "low" }) })`.
+Default model is `gpt-realtime-2`. Passing the GA marker to `Patter.agent`
+auto-resolves `provider = "openai_realtime"` so the rest of the pipeline
+(metrics, dashboard, cost line) treats the call identically to a v1
+Realtime call.
+
+Implementation: a handful of `private readonly` fields on the v1 adapter
+(`apiKey`, `model`, `voice`, `instructions`, `tools`, `audioFormat`,
+`options`, `ws`, `armHeartbeatAndListener`) were promoted to `protected`
+so the subclass can reuse the heartbeat + message dispatch. No public
+surface changed; both adapters still expose the exact same method set.
+
+Files: `libraries/typescript/src/providers/openai-realtime-2.ts` (new,
+~190 lines), `libraries/typescript/src/engines/openai-2.ts` (new, ~75
+lines), `libraries/typescript/src/providers/openai-realtime.ts` (visibility
+bumps only), `libraries/typescript/src/client.ts` (instanceof dispatch),
+`libraries/typescript/src/server.ts` (`buildAIAdapter` selects the new
+adapter when `engine.kind === "openai_realtime_2"`),
+`libraries/typescript/src/types.ts` (engine union widened),
+`libraries/typescript/src/index.ts` (re-export). Python parity is a
+follow-up — `OpenAIRealtime2` is TS-only in this commit, the daily
+`docs-feature-drift` job will flag it.
+
+Verified end-to-end on a real Twilio PSTN call:
+`Call ended: ... (13.6s, 3 turns, cost=$0.0255, p95 wait=642ms,
+engine=openai_realtime_2)` — `firstMessage` plays in the configured voice
+(`alloy`), language follows `systemPrompt`, audio flows both directions.
+
+### Fixed — Dashboard MetricsPanel: Latency/Cost tabs render at the same height
+
+Switching the MetricsPanel tabs between **Latency** and **Cost** caused a
+visible vertical jump because each layout had a different natural height —
+Latency (pipeline mode) renders 4 latency cards + a 3-row waterfall +
+legend (~230 px), while Cost renders only the cost bar + 4-6 stack rows
+(~180 px). The card outer height changed by ~50 px on every toggle.
+
+Wrapped the tab content in a ``.metrics-panel-body`` container with
+``min-height: 240px`` — sized to the tallest layout (pipeline Latency).
+Both tabs now occupy exactly 321 px outer (body 240 px) and the tab
+switch is purely a content swap.
+
+Files touched:
+  dashboard-app/src/components/MetricsPanel.tsx
+  dashboard-app/src/styles/dashboard.css
+  libraries/python/getpatter/dashboard/ui.html (resynced bundle)
+  libraries/typescript/src/dashboard/ui.html (resynced bundle)
+
+### Added — Dashboard: select & soft-delete calls (logs preserved as backup)
+
+Operators can now select one or more calls in the dashboard call list and
+remove them from the view + rolling metrics. The on-disk artefacts written
+by ``CallLogger`` (``<log_root>/calls/YYYY/MM/DD/<call_id>/metadata.json``
+and ``transcript.jsonl``) are intentionally NOT touched — they remain as a
+durable backup that the operator can audit or re-import outside the
+dashboard.
+
+Behaviour:
+
+- Soft-deleted ``call_id``s are excluded from ``get_calls`` / ``get_call`` /
+  ``get_aggregates`` / ``get_calls_in_range`` / ``call_count``. The "Avg
+  latency p95" and "Spend" cards recompute against the visible set, so the
+  numbers always match what the operator sees in the table.
+- Active calls are never deletable; a mid-call delete from the UI is
+  silently skipped server-side so the live-transcript pane cannot be
+  orphaned.
+- The deleted set persists to ``<log_root>/.deleted_call_ids.json`` (atomic
+  write). On process restart ``hydrate()`` reloads the set so previously
+  deleted calls stay hidden, while the on-disk metadata is left intact.
+
+API additions (parity across SDKs):
+
+- ``DELETE /api/dashboard/calls/:call_id`` — remove one.
+- ``POST /api/dashboard/calls/delete`` with ``{"call_ids": [...]}`` — batch.
+- SSE event ``calls_deleted`` with payload ``{ "call_ids": [...] }`` so
+  other tabs / external clients re-render immediately.
+
+Store-level API:
+
+- ``MetricsStore.delete_calls(call_ids)`` / ``deleteCalls(callIds)``
+- ``MetricsStore.is_deleted(call_id)`` / ``isDeleted(callId)``
+- ``MetricsStore.get_deleted_call_ids()`` / ``getDeletedCallIds()``
+
+UI: the call table gains a checkbox column (live rows disabled). Selecting
+≥1 row reveals a bulk-action bar with a clear-selection ghost button and a
+peach destructive "Delete" button gated by an inline confirmation step that
+explains the on-disk logs are preserved.
+
+Files touched:
+  libraries/typescript/src/dashboard/store.ts (deletedCallIds + filters)
+  libraries/typescript/src/dashboard/routes.ts (DELETE + batch POST)
+  libraries/python/getpatter/dashboard/store.py (parity)
+  libraries/python/getpatter/dashboard/routes.py (parity)
+  dashboard-app/src/components/CallTable.tsx (multi-select + bulk bar)
+  dashboard-app/src/components/icons.tsx (IconTrash / IconCheck / IconX)
+  dashboard-app/src/styles/dashboard.css (checkbox + bulk-bar styles)
+  dashboard-app/src/hooks/useDashboardData.ts (calls_deleted SSE +
+    removeCallsLocal optimistic update)
+  dashboard-app/src/lib/api.ts (deleteCalls client)
+  dashboard-app/src/App.tsx (wiring)
+  CHANGELOG.md
+  tests: dashboard-store delete coverage (TS + Py).
+
+### Fixed — One-shot barge-in: VAD now reset between agent turns
+
+After a successful barge-in on PSTN (no-AEC), subsequent barge-in attempts in the
+same call silently failed. Root cause: PSTN echo of the agent's TTS played back
+through the caller's phone speaker and returned through the mic, keeping
+SileroVAD's smoothed probability above `deactivationThreshold` (0.35) for the
+entire agent turn. The detector's `pubSpeaking` / `_pub_speaking` state stayed
+`true` across turns, so the next user utterance never produced a fresh
+`SILENCE → SPEECH` transition and `speech_start` never fired — barge-in
+behaved as if it were "one shot".
+
+Fix: added an optional `reset()` hook to the `VADProvider` interface
+(TypeScript) / abstract base class (Python). `SileroVAD` implements it by
+clearing the pending buffer, `pubSpeaking`, the speech/silence threshold
+durations, the exponential smoothing filter, AND the ONNX model's RNN hidden
+state + rolling context. `StreamHandler` invokes the reset in two places:
+
+  1. **`beginSpeaking()` / `_begin_speaking()`** — every new agent turn starts
+     with a clean VAD. The user's previous utterance has already been
+     committed by STT so no audio is lost.
+  2. **`endSpeakingWithGrace()` grace-timer fire** — natural turn end leaves
+     VAD ready for the next spontaneous user utterance.
+
+Failures in the optional `reset()` hook are logged and swallowed; a flaky
+reset can never silently kill barge-in for the rest of the call.
+
+Parity bonus: `_begin_speaking()` in Python now stamps `_first_audio_sent_at`
+unconditionally (matching TypeScript `beginSpeaking()` since 2026-05-11). The
+`is_first_message` parameter is kept for backward compat with callers but no
+longer changes behaviour. Without this, a turn with a slow LLM was
+un-interruptible for the entire LLM TTFT window because the barge-in gate
+anchor stayed `None`.
+
+Files: `libraries/typescript/src/types.ts`,
+`libraries/typescript/src/providers/silero-vad.ts`,
+`libraries/typescript/src/stream-handler.ts`,
+`libraries/python/getpatter/providers/base.py`,
+`libraries/python/getpatter/providers/silero_onnx.py`,
+`libraries/python/getpatter/providers/silero_vad.py`,
+`libraries/python/getpatter/stream_handler.py`.
+
+### Fixed — Barge-in gate reduced 250 ms → 100 ms; suppressed speech flushed to STT on grace end
+
+Two related barge-in defects on Twilio PSTN (no-AEC path):
+
+1. **Gate too long.** `MIN_AGENT_SPEAKING_MS_BEFORE_BARGE_IN_NO_AEC` was 250 ms, blocking
+   every `speech_start` VAD event for the first 250 ms after the agent began speaking.
+   On short agent turns (< ~400 ms of audio) the gate expired only near the end of the
+   turn, so the user's interruption was silently suppressed. Reduced to 100 ms, which is
+   still enough to block PSTN echo loopback (~100–200 ms round-trip) while letting genuine
+   user speech through on typical responses.
+
+2. **Suppressed speech silently discarded.** When VAD fired `speech_start` during the
+   agent's turn but barge-in was gate-suppressed, the user's audio accumulated in
+   `inboundAudioRing` / `_inbound_audio_ring` but was never flushed. The ring is cleared
+   at `beginSpeaking` / `_begin_speaking` (start of the next agent turn), so the user's
+   words vanished without ever reaching STT. Added `suppressedSpeechPending` /
+   `_suppressed_speech_pending` flag: set when speech_start is suppressed, cleared on
+   barge-in or new turn, and on grace-timer expiry the ring is flushed to STT so the
+   user's message is processed.
+
+Files: `libraries/typescript/src/stream-handler.ts`,
+`libraries/python/getpatter/stream_handler.py`.
+
+### Fixed — StatefulResampler FIR cold-start transient on first TTS chunk
+
+`StatefulResampler` (TypeScript, `libraries/typescript/src/audio/transcoding.ts`) seeded
+its 5-tap FIR history with `input[0]` on the first call. When ElevenLabs HTTP streaming
+delivers an audio chunk that starts at non-zero amplitude, this produced a startup
+transient on the resampled output — audible as a brief crackle at the beginning of the
+first TTS message. Fixed: FIR history is now seeded with zeros (the correct initial
+condition for a filter that has received no prior input), eliminating the transient.
+No Python equivalent — Python uses `scipy.signal.resample_poly` which handles boundary
+conditions internally.
+
+### Fixed — First-message crackling on Twilio PSTN: streaming path now uses simple sendAudio
+
+Root cause: the streaming first-message path (non-prewarm) was routing every
+ElevenLabs HTTP chunk through `sendPacedFirstMessageBytes` /
+`_send_paced_first_message_bytes`. That function was designed for the prewarm
+case (one large pre-synthesised buffer) and resets drain+counter state on each
+call. Applied per streaming chunk (~128 ms each), the drain+reset destroyed
+mark back-pressure continuity and the per-sub-chunk playout sleep slowed
+delivery below Twilio's playout rate, causing periodic buffer underruns
+(crackling on the first message only). Subsequent LLM responses used the
+simpler `synthesizeSentence` / `_synthesize_sentence` path (plain `sendAudio`)
+and never crackled, confirming the fix direction.
+
+Fix: the streaming first-message path now uses the same plain
+`encodePipelineAudio + sendAudio + markFirstAudioSent` pattern as subsequent
+turns. The prewarm path (pre-synthesised buffer) is unchanged and still uses
+`sendPacedFirstMessageBytes` / `_send_paced_first_message_bytes` because that
+buffer can be several seconds long and needs mark-gated pacing. Files:
+`libraries/typescript/src/stream-handler.ts`,
+`libraries/python/getpatter/stream_handler.py`.
+
+### Changed — Cerebras usage-chunk fallback: INFO-once + DEBUG per iteration (Python + TypeScript parity)
+
+The char/4 fallback billing path in `services/llm_loop.py` /
+`src/llm-loop.ts` previously emitted `logger.warning` /
+`getLogger().warn` on every tool-loop iteration when the upstream
+provider stream did not include a `usage` chunk. On Cerebras (the
+common case for this fallback), a multi-tool turn could log 5-10
+identical WARN lines for the same call — drowning real warnings.
+
+Replaced with: first fallback in the call → INFO (so operators
+still see it once with the full diagnostic context — `provider`,
+`model`, `input_chars`, `output_chars`, `est_input_tokens`,
+`est_output_tokens`); subsequent iterations → DEBUG with the
+iteration index and a per-LLMLoop `_usage_missing_count` /
+`_usageMissingCount` total so the volume is still visible at
+DEBUG level. No behavioural change — billing still uses char/4
+estimation. Files: `libraries/python/getpatter/services/llm_loop.py`,
+`libraries/typescript/src/llm-loop.ts`.
+
+### Changed — Krisp VIVA TypeScript scaffold: refreshed unavailability message (2026-05)
+
+The `KrispVivaFilter` constructor in
+`libraries/typescript/src/providers/krisp-filter.ts` already throws
+with guidance because Krisp does not publish a Node.js server SDK as
+of 2026-05. Refreshed the message to include the verification date,
+explicitly distinguish "server Node SDK" from existing browser/RN
+third-party wrappers, and note that those wrappers (browser WASM and
+mobile client variants) are scoped to local microphone capture and
+cannot process Patter's server-side PCM/mulaw audio. Python
+`KrispVivaFilter` and TS `DeepFilterNetFilter` remain the only
+shipped paths. No code behaviour change.
+
+### Fixed — Barge-in gate regression test: prewarmed first message must remain interruptible
+
+Locked in with parity tests on both SDKs that `_stream_prewarm_bytes` / `streamPrewarmBytes` open the barge-in gate (`_first_audio_sent_at` / `firstAudioSentAt`) once the first chunk reaches the wire. The gate was already opened by `_begin_speaking(is_first_message=True)` ahead of streaming, but a future refactor of the `_begin_speaking` path could regress the prewarm path silently — the per-chunk `_mark_first_audio_sent` call inside the streaming loop is the last line of defence and now has explicit coverage in `test_stream_prewarm_bytes_opens_barge_in_gate_on_first_chunk` (Python) and `opens the barge-in gate by stamping firstAudioSentAt after the first chunk` (TypeScript).
+
+Files: `libraries/python/tests/test_prewarm.py`, `libraries/typescript/tests/unit/prewarm.test.ts`.
+
+### Fixed — `ElevenLabsWebSocketTTS.adopt_websocket` leaked the previous parked WS when called outside an event loop
+
+`ElevenLabsWebSocketTTS.adopt_websocket` (Python) closed any previously parked WS handle via `asyncio.create_task(prev.ws.close())`. When invoked from a sync context with no running event loop — e.g. cleanup hooks fired from `__del__`, atexit handlers, or signal-driven teardown — the `create_task` call raised `RuntimeError` which the code silently swallowed with a bare `except RuntimeError: pass`, leaking the socket FD. ElevenLabs would eventually close the remote side after the inactivity timeout, but the FD on our side stayed allocated until process exit.
+
+The fix keeps the async fast path when a loop is running, and falls back to a best-effort synchronous `transport.close()` (non-blocking, skips the WS close handshake but cleans up the file descriptor) when no loop is available. A warning log is emitted on the fallback path so the FD-leak symptom shifts from "silent" to "logged".
+
+The TypeScript counterpart `adoptWebSocket` is unaffected — `ws.close()` from the `ws` package is synchronous so the same scenario doesn't reach an analogous error branch.
+
+Files: `libraries/python/getpatter/providers/elevenlabs_ws_tts.py`, `libraries/python/tests/unit/test_elevenlabs_ws_tts.py` (new `TestAdoptWebSocketCleanup`).
+
+### Added — `patter.*` OTel attribute helpers in the TypeScript SDK (parity with Python)
+
+The Python SDK ships `record_patter_attrs`, `patter_call_scope`, and `attach_span_exporter` (in `getpatter.observability.attributes`) for stamping `patter.cost.*` / `patter.latency.*` span attributes and wiring an OTel `SpanExporter` into the tracer provider. The TypeScript SDK previously had no equivalent surface — calling code that wanted to record those attributes had to no-op manually or import `@opentelemetry/api` directly, which broke cross-SDK parity per `.claude/rules/sdk-parity.md`.
+
+This change ports the helpers to TypeScript as no-ops by default. When `PATTER_OTEL_ENABLED` is unset or `@opentelemetry/api` is not installed, every helper is a fast no-op, so existing call sites stay zero-cost. Available as:
+
+```ts
+import {
+  recordPatterAttrs,
+  patterCallScope,
+  attachSpanExporter,
+  DEFAULT_SIDE,
+} from 'getpatter/observability';
+```
+
+Semantic mapping (1:1 with Python):
+
+- `recordPatterAttrs(attrs)` ↔ `record_patter_attrs(attrs)`
+- `patterCallScope({ callId, side }, fn)` ↔ `patter_call_scope(call_id=..., side=...)` (the JS form takes an async callback because JS lacks `with`-style context managers; the closure is the scope body)
+- `attachSpanExporter(patterInstance, exporter, { side })` ↔ `attach_span_exporter(patter, exporter, side=...)`
+
+Files: `libraries/typescript/src/observability/attributes.ts` (new), `libraries/typescript/src/observability/index.ts` (re-exports), `libraries/typescript/tests/unit/observability-attributes.test.ts` (new).
+
+### Fixed — `EOUMetrics` field semantics + unit parity between Python and TypeScript SDKs
+
+The Python implementation in `libraries/python/getpatter/services/metrics.py:_emit_eou_metrics` had `end_of_utterance_delay` and `transcription_delay` swapped relative to the TypeScript counterpart, and emitted them in seconds while the TypeScript SDK and the rest of the observability surface (`ttfb_ms`, `turn_ms`) use milliseconds. The dashboard, EventBus subscribers and any downstream exporter consuming both SDKs would have seen the two fields disagree by a factor of 1000× AND swapped — silently corrupting end-of-utterance latency dashboards on cross-SDK fleets.
+
+The convention is now uniform across both SDKs (locked in by tests):
+
+- `end_of_utterance_delay` / `endOfUtteranceDelay` = `stt_final − vad_stopped` (milliseconds)
+- `transcription_delay` / `transcriptionDelay` = `turn_committed − vad_stopped` (milliseconds)
+- `on_user_turn_completed_delay` / `onUserTurnCompletedDelay` = pipeline hook execution time (milliseconds)
+
+Negative deltas from clock skew or out-of-order timestamps are now clamped to `0` on both sides (the TypeScript side already did this; Python now does too).
+
+Files: `libraries/python/getpatter/services/metrics.py`, `libraries/python/getpatter/observability/metric_types.py` (docstring), `libraries/python/tests/test_metrics.py` (new `TestEOUMetricsEmission`), `libraries/typescript/tests/unit/metrics.test.ts` (new `emitEouMetrics field semantics` block).
+
+### Fixed — Barge-in bug bundle: 6.8s latency outliers, double-talk dispatch, stale anchors, firstMessage uninterruptible (Python + TypeScript parity)
+
+Real PSTN test (round 10f, 11 turns with user-initiated interruptions) surfaced four correlated bugs in the barge-in pipeline that the previous strategy work in 0.6.1 did not cover. Investigation report (`/private/tmp/.../a6fae04df253294f2.output`) traced all four to anchor mismanagement around the interrupt boundary plus an over-aggressive VAD threshold.
+
+**Bug 1 — endpoint_ms == stt_ms == 6818 ms (dishonest p95 outliers).** `recordSttComplete` was fabricating `_endpointSignalAt = _sttComplete` when no legitimate VAD `speech_end` had fired, producing a synthetic anchor that then made `endpoint_ms = _turnCommittedMono − _turnStart` (the entire turn duration). Fix: never fake the anchor; let `endpoint_ms` be `undefined` on the affected turn and increment a `_endpointSignalMissingCount` counter for observability. Added a 100 ms post-barge-in gate (`_lastBargeinAt`): the next turn's `endpoint_ms` / `stt_ms` are dropped from the percentile distribution since post-barge-in anchors are inherently noisy. Files: `libraries/typescript/src/metrics.ts:412-422,538-549,572-596,870-984`, `libraries/python/getpatter/services/metrics.py:289,362,395,696`.
+
+**Bug 2 — double-talk: agent answered the 1st sentence while user said the 2nd.** Deepgram emits `is_final` on any pause > a few ms; the SDK dispatched LLM immediately. Two fixes ship together:
+
+1. **Bumped Silero `minSilenceDuration` default `0.1` → `0.4` s**. The previous 100 ms threshold fired VAD `speech_end` on natural inter-sentence pauses (typically 200-400 ms), which then prematurely finalised the user turn at the STT layer. 0.4 s is the industry-standard default for telephony agents: bridges intra-utterance pauses without delaying single-sentence turns by more than the natural conversational gap. Files: `libraries/typescript/src/providers/silero-vad.ts:366-378`, `libraries/python/getpatter/providers/silero_vad.py:125`.
+2. **Synchronous STT-final → LLM dispatch (no debounce)**. An earlier 400 ms debounce attempt (`_scheduleTurnCommit` / `_runDeferredTurnCommit`) was prototyped and rolled back before release: the partial-transcript reschedule branch overwrote the dispatched FINAL text with the latest partial, silently dropping entire user turns during slow-LLM windows. Verified on real PSTN (round 10k, gpt-5-nano: 3 of 5 user turns dropped). The shipped behaviour dispatches on `is_final` immediately; when Deepgram emits two close-together finals like `"What's the"` then `"What's the best?"`, the SDK answers both (benign double-answer) instead of dropping the first (catastrophic). Tracked future improvements documented internally — options include raising Deepgram `endpointingMs` per-agent, queue-cancel semantics, and sentence-segment merge in `commitTranscript`. Files: `libraries/typescript/src/stream-handler.ts` (inline dispatch restored), `libraries/python/getpatter/stream_handler.py` (`_dispatch_turn` called inline from `_stt_loop`).
+
+**Bug 3 — anchors stale after strategy-confirmed barge-in.** `runBargeInCancel` cleared anchors via `_resetTurnState()` but never re-anchored to the next legitimate VAD `speech_start`; the next turn either inherited stale anchors or anchored to the first inbound audio byte (adding ~250 ms ring-buffer delay to every post-barge-in turn). Added `anchorUserSpeechStart()` calls in three places: after `recordTurnInterrupted` in `runBargeInCancel`, and on the pending-barge-in timeout path. Also `_resetTurnState` now resets `_initialTtfbEmitted` (TS) / `_initial_ttfb_emitted` + `_llm_ttfb_emitted` + `_tts_ttfb_emitted` (Py) so EventBus TTFB re-fires after barge-in when `reportOnlyInitialTtfb=true`. Files: `libraries/typescript/src/stream-handler.ts:2034-2058`, `libraries/typescript/src/metrics.ts:846-867`, Python mirrors.
+
+**Bug 4 — firstMessage was uninterruptible by VAD for 300-800 ms.** `canBargeIn()` gates on `firstAudioSentAt !== null`, but that field was only stamped when the first audio chunk arrived from the TTS provider — meaning the 250 ms anti-flicker timer didn't start until the user had already missed the TTFB window. Fix: `beginSpeaking(isFirstMessage=true)` now stamps `firstAudioSentAt = Date.now()` synchronously, so the gate timer runs in parallel with TTS TTFB. The firstMessage TTS loop already breaks on `!this.isSpeaking`, so user speech now propagates cancellation correctly. Files: `libraries/typescript/src/stream-handler.ts:357,1477`, `libraries/python/getpatter/stream_handler.py:3187,2043`.
+
+### Changed — Dashboard percentile threshold lowered 5 → 2 turns
+
+`LatencyPanel` and `MetricsPanel` displayed `—` for `p50` / `p95` until a call had ≥5 turns. On most PSTN calls (typically 4-7 turns) the detail pane showed dashes while the call-list `P95 LATENCY` column already showed a real number via `avg` fallback — confusing for users comparing the two surfaces. Lowered to 2 turns so the detail pane matches the list column. With n=2 the percentile is statistically thin but consistent with what the list shows.
+
+Files: `dashboard-app/src/components/LatencyPanel.tsx:12`, `dashboard-app/src/components/MetricsPanel.tsx:76,127`. Bundle synced to `libraries/{typescript,python}/.../dashboard/ui.html` via `dashboard-app/scripts/sync.mjs`.
+
+### Added — Krisp VIVA noise-suppression scaffold for TypeScript SDK
+
+Mirrors the Python `KrispVivaFilter` API at `libraries/typescript/src/providers/krisp-filter.ts` for cross-SDK parity. Class signature accepts the same options (`modelPath`, `noiseSuppressionLevel`, `frameDurationMs`, `sampleRate`) but throws at construction time with guidance — Krisp does not publish an official Node.js SDK as of 2026-05. Opt-in, proprietary, license required, no default-on. Patter ships only the interface; users supply SDK + `.kef` model.
+
+Available paths today:
+1. **Python SDK**: `from getpatter.providers.krisp_filter import KrispVivaFilter` — fully implemented (existed prior to this change, unmodified). Requires `pip install getpatter[krisp]` + `KRISP_VIVA_SDK_LICENSE_KEY` + `KRISP_VIVA_FILTER_MODEL_PATH`.
+2. **TypeScript today**: `new DeepFilterNetFilter({ modelPath })` from `getpatter` — community ONNX export, no license. `KrispVivaFilter` throws until a Node binding is available.
+
+New top-level exports from `getpatter`: `KrispVivaFilter`, `KrispVivaFilterOptions`, `KrispSampleRate`, `KrispFrameDuration`, `DeepFilterNetFilter`, `DeepFilterNetOptions`. The TS scaffold closes when an official Krisp Node SDK ships or a community NAPI/WASM binding becomes available.
+
+### Fixed — Dashboard live SSE update wiped transcripts + latency from prior calls
+
+When a new call started, the live SSE refresh in
+`dashboard-app/src/hooks/useDashboardData.ts:103` rebuilt the entire
+calls array from `mergeCalls(active, recent)` without consulting the
+previous state. If the new payload had any field as undefined — common
+when the server-side `MetricsStore.updateCallStatus` writes a synthetic
+"terminal" record with `metrics: undefined` ahead of the true
+`recordCallEnd` — the prior call lost its transcripts and latency p50/
+p95 in the UI. Added `mergeCallPreserving(prev, next)` that does
+`next.field ?? prev.field` per critical field, masking the lossy
+secondary records server-side. The SDK-side double-write race in
+`libraries/typescript/src/dashboard/store.ts:134-186` is flagged with a
+TODO for 0.6.2.
+
+### Changed — `elevenlabs.TTS` facade now defaults to WebSocket streaming (Python + TypeScript parity)
+
+Industry best practice for telephony agents is a long-lived WS connection — every other Patter STT adapter (Deepgram nova-3, Cartesia ink-whisper, Whisper streaming, AssemblyAI) already runs on persistent WS. ElevenLabs TTS was the outlier: the default `elevenlabs.TTS()` facade opened a fresh HTTP POST per sentence (TLS handshake, DNS, full request setup repeated on every turn), producing measured TTFB p50 ~265 ms on PSTN — vs ElevenLabs's published server-side TTFT of ~75 ms. The gap was almost entirely HTTP setup, not synthesis.
+
+Flipped both SDKs to extend the WebSocket class (`_ElevenLabsWebSocketTTS` / `_ElevenLabsTTSWebSocket`) by default. Expected TTFB p50 drop: ~265 ms → ~80-100 ms (after the first turn pays one handshake; turn 2+ reuses the open WS).
+
+- TS: `libraries/typescript/src/tts/elevenlabs.ts` — `class TTS extends _ElevenLabsWebSocketTTS`. Default `voiceId="EXAVITQu4vr4xnSDxMaL"`, `modelId="eleven_flash_v2_5"`, `outputFormat="pcm_16000"`, `autoMode=true`. `providerKey` flipped `"elevenlabs"` → `"elevenlabs_ws"`. `for_twilio`/`for_telnyx` signatures unchanged.
+- Py: `libraries/python/getpatter/tts/elevenlabs.py` — `class TTS(_ElevenLabsWebSocketTTS)` with matching defaults. `chunk_size` kept as tolerated-but-ignored kwarg (the WS path doesn't use it) to avoid breaking pinned callers.
+- Compatibility aliases preserved: `elevenlabs_ws.TTS` (TS + Py) now re-exports from `elevenlabs.TTS`. `ElevenLabsWebSocketTTS` top-level symbol unchanged.
+
+**REST opt-out** — new top-level export `ElevenLabsRestTTS` in both SDKs. Use when:
+- The free / starter tier (WS requires Pro plan; the WS class raises `PLAN_REQUIRED_MSG` directing callers to `ElevenLabsRestTTS`).
+- The `eleven_v3` model (HTTP-only — the WS class rejects it at construction with the same redirect).
+
+```ts
+// TS
+import { ElevenLabsRestTTS } from "getpatter";
+const tts = new ElevenLabsRestTTS(process.env.ELEVENLABS_API_KEY!);
+```
+```python
+# Python
+from getpatter import ElevenLabsRestTTS
+tts = ElevenLabsRestTTS(api_key=os.environ["ELEVENLABS_API_KEY"])
+```
+
+Dashboard label-prettifier extended in `dashboard-app/src/components/{CostPanel,MetricsPanel}.tsx` — `titleCase()` regex now strips `_ws` / `_rest` transport suffixes in addition to `_stt` / `_tts` / `_llm` role suffixes. `"elevenlabs_ws"` now renders as "Elevenlabs" without the suffix bleed into UI. Repeated `+` handles compound suffixes (`"cartesia_tts_ws"` → `"Cartesia"`).
+
+Provider error messages in `providers/elevenlabs-ws-tts.{ts,py}` updated: `payment_required` and `eleven_v3` rejections now direct users to `ElevenLabsRestTTS` (was `ElevenLabsTTS` — which is now the WS facade itself, making the previous text recursive).
+
+Tests: 173 Python (was 170) + 95 TS (was 93) pass. 1 REST-specific assertion in `test_tts_facade_language.py` migrated to `ElevenLabsRestTTS` (the `chunk_size == 4096` default). 2 new tests each side verify the flip semantics and the opt-out is not aliased.
+
+Acceptance matrix: 25 duplicate `outbound-*-elevenlabs-ws.ts` scenarios removed (now functionally identical to `outbound-*-elevenlabs.ts`). Added 1 explicit regression `outbound-deepgram-cerebras-elevenlabs-rest.ts` to keep the REST path exercised. `_manifest.json` updated (78 entries).
+
+Migration: **0 code changes** for callers using the default — they automatically benefit from the latency drop. **1-line import rename** for callers who deliberately want HTTP REST (`ElevenLabsTTS` → `ElevenLabsRestTTS`).
+
+### Fixed — Console "Call ended" summary log p95 used `total_ms`, not `agent_response_ms` (Python + TypeScript parity)
+
+The single-line `[PATTER] Call ended: ... p95=Xms` log emitted by `stream_handler.ts` (TS) and `telephony/{twilio,telnyx}.py` (Py) at the end of every call read `latency_p95.total_ms` — the round-trip duration that **includes** how long the user spoke (`user_speech_duration_ms`), not the system-controlled wait time. The metrics module itself flags this in `metrics.ts:85-89`: "Unlike `total_ms` (which spans the user's entire utterance and therefore grows with how long the user spoke), `agent_response_ms` isolates the system-controlled latency."
+
+The dashboard already shows the correct field — `agent_response_ms` — under the **"p95 wait"** tile (`LatencyPanel.tsx:48`, `mappers.ts:221`). The console log diverged: a 51.6 s, 7-turn call where the user spoke ~1.2 s/turn printed `p95=2577ms` while the dashboard showed `p95 wait=1361ms` for the same call. The 1361 ms is the genuine user-perceived wait; the 2577 ms confused users into thinking the SDK was slow.
+
+Switched both SDKs to read `latency_p95.agent_response_ms` (fallback `total_ms` for legacy short calls where the percentile isn't computed) and renamed the label to **`p95 wait=Xms`** to match the dashboard tile word-for-word. Files: `libraries/typescript/src/stream-handler.ts:2810-2820`, `libraries/python/getpatter/telephony/twilio.py:657-680`, `libraries/python/getpatter/telephony/telnyx.py:792-810`.
+
+### Fixed — Telnyx pricing direction-aware: inbound 2× over-bill resolved
+
+Audited against https://telnyx.com/pricing/elastic-sip (verified
+2026-05-11). The previous flat `"telnyx": $0.007/min` over-billed
+inbound calls by 2× ($0.0035 real) and approximately matched outbound
+($0.005-0.009 range). Split into two entries:
+- `telnyx_inbound`: $0.0035/min (US local termination)
+- `telnyx_outbound`: $0.007/min (Pay-As-You-Go mid-range)
+The legacy `telnyx` key is preserved at $0.007 for backward-compat with
+users who override `pricing={"telnyx": {...}}` and don't know direction.
+Billing granularity confirmed per-minute (not per-second as previous
+internal docs claimed). Files: `libraries/python/getpatter/pricing.py`,
+`libraries/typescript/src/pricing.ts`. Tests added at
+`libraries/python/tests/test_pricing.py`,
+`libraries/typescript/tests/pricing.test.ts`.
+
+### Fixed — Python Twilio STT cost 4× over-bill (sample rate / bytes-per-sample mismatch)
+
+`libraries/python/getpatter/telephony/twilio.py` configured the metrics
+STT format as `(sample_rate=8000, bytes_per_sample=1)` (mulaw 8 kHz),
+but `stream_handler.py` already decodes the inbound mulaw to PCM16
+@ 16 kHz before feeding bytes to `metrics.add_stt_audio_bytes()`. With
+the inverted format, every 60 s of real audio was reported as 240 s and
+billed 4× the true cost ($0.0192 instead of $0.0048 against Deepgram
+Nova-3 at $0.0048/min). TypeScript was unaffected (default 16000/2 was
+never overridden); Python Telnyx was unaffected (already configured 16000/2).
+Fix: `configure_stt_format(sample_rate=16000, bytes_per_sample=2)` in
+the Twilio adapter, plus a regression test asserting 1.92 MB of PCM16
+bytes = 60 s of audio. Customers were over-billed; refund window TBD.
+
+### Fixed — Dashboard "−$X cached" badge dead for Realtime prompt-caching savings
+
+The SDK emits `cost.llm_cached_savings` (Realtime / Anthropic prompt
+caching discount) but `dashboard-app/src/lib/mappers.ts:computeCost()`
+never read it, so `Call.cost.cached` was always undefined and the badge
+in `CostPanel.tsx:64` never rendered. Wired the field through
+`api.ts:CallCost` (added `llm_cached_savings?: number` + `parseCost`)
+and the mapper now populates `result.cached`. The "−$0.00X cached" line
+now appears next to the LLM cost row whenever a Realtime call has any
+cached-token savings.
+
+### Changed — LLM usage-chunk char/4 fallback log bumped DEBUG → WARN (Python + TypeScript)
+
+The 0.6.1 char/4 fallback (added when Cerebras was observed dropping
+the `usage` chunk on some streams) was logging at DEBUG, so silent-zero
+incidents only showed up in dev runs. Bumped to WARN in
+`libraries/python/getpatter/services/llm_loop.py` and
+`libraries/typescript/src/llm-loop.ts` so production observability
+surfaces it. Message: "LLM usage chunk missing from {provider}/{model};
+estimating output_tokens=N via char/4 fallback".
+
+### Fixed — Deepgram STT pricing reflected legacy standard rate, not the current PAYG promo (Python + TypeScript parity)
+
+Audited against https://deepgram.com/pricing (verified 2026-05-11). Deepgram is currently running a "Limited-time promotional rates on streaming" tier that customers actually pay today; the prior $0.0077/min Nova-3 figure was the launch-era standard rate that has been struck through on the public page.
+
+| Model | Old (USD / min) | New (USD / min) | Notes |
+|-------|-----------------|-----------------|-------|
+| `nova-3` (default) | $0.0077 | **$0.0048** | over 60% |
+| `nova-3-multilingual` | $0.0092 | **$0.0058** | over 58% |
+| `flux` (added) | — | **$0.0065** | Flux English; new event-driven STT (2026) |
+| `flux-english` (added) | — | **$0.0065** | alias of `flux` |
+| `flux-multilingual` (added) | — | **$0.0078** | new |
+| `nova-2`, `nova`, `whisper-*` | unchanged | unchanged | legacy / non-Nova-3 tiers |
+
+Dropped the `"deepgram"` provider-level default from $0.0077 to $0.0048 (Nova-3 monolingual is the Patter default model). A 25-minute call against the default would have reported $0.1925 in `cost.stt` instead of the actual $0.12 — over-reporting by ~60%. Customers were never undercharged; the dashboard line item was wrong. Files: `libraries/python/getpatter/pricing.py`, `libraries/typescript/src/pricing.ts`. Tests updated at `libraries/python/tests/test_pricing.py`, `libraries/typescript/tests/pricing.test.ts`, and the matching soak tests. Revisit when Deepgram removes the promo banner.
+
+### Fixed — ElevenLabs pricing table overcharged Flash 20% and Multilingual v2 / v3 by 80-200% (Python + TypeScript parity)
+
+Audited against the canonical public API pricing page at https://elevenlabs.io/pricing/api (verified 2026-05-11). The per-1K-character API/overage rate is flat across all plan tiers (Free → Business); only the included character bundle varies. Patter's 2026-05 table reflected legacy Creator-plan overage figures and a launch-era v3 quote that have since been consolidated.
+
+| Model | Old (USD / 1K chars) | New (USD / 1K chars) | Notes |
+|-------|----------------------|----------------------|-------|
+| `eleven_flash_v2_5` | $0.06 | **$0.05** | Patter default; was 20% over |
+| `eleven_turbo_v2_5` | $0.05 | $0.05 | unchanged ✓ |
+| `eleven_multilingual_v2` | $0.18 | **$0.10** | was 80% over |
+| `eleven_v3` | $0.30 | **$0.10** | grouped with multilingual v2 on the public page; was 200% over |
+| `eleven_monolingual_v1` (legacy) | $0.18 | **$0.10** | matches multilingual tier |
+
+Also dropped the `"elevenlabs"` / `"elevenlabs_ws"` provider-level default from $0.06 to $0.05 (flash_v2_5 is the Patter default model). A 5-turn call against the default would have reported $0.000060/char × N chars instead of the actual $0.000050/char — over-reporting LLM-bill-equivalent TTS cost by 20%. Customers were never undercharged, but the dashboard cost line was wrong. Files: `libraries/python/getpatter/pricing.py`, `libraries/typescript/src/pricing.ts`. Tests updated at `libraries/python/tests/test_pricing.py`, `libraries/typescript/tests/pricing.test.ts`, plus the matching soak tests.
+
+### Fixed — Dashboard cost labels leaked provider-key suffix (`Cartesia_stt STT` → `Cartesia STT`)
+
+The Cost panel's `titleCase()` helper rendered raw SDK `provider_key` literals (e.g. `cartesia_stt`, `elevenlabs_tts`) which the SDK uses to disambiguate provider-class lookups. The `_stt` / `_tts` / `_llm` suffix is internal noise: the panel already shows the role label next to the swatch ("STT", "TTS", "LLM"), so the suffix duplicated context and produced strings like "Cartesia_stt STT · ink-whisper". Stripped the suffix in both `dashboard-app/src/components/CostPanel.tsx` and `dashboard-app/src/components/MetricsPanel.tsx` `titleCase()` so labels render "Cartesia STT · ink-whisper" / "Elevenlabs TTS · eleven_flash_v2_5".
+
+### Fixed — Phantom `speech_start` during agent TTS contaminated turn anchors (Python + TypeScript parity)
+
+A real PSTN call surfaced `user_speech_duration_ms` of 5-7 seconds for utterances the caller actually spoke in ~1 second. Forensic timeline reconstruction (`releases/0.6.0/typescript/call-logs/.../CA6d7fc612...`) pinned the contamination to two bug classes uncovered by parallel-agent audit (forensic + architect + adversarial + provider-reviewer agreement):
+
+1. **Phantom-speech-start anchor contamination** — `StreamHandler` called `metrics.start_turn_if_idle()` on EVERY VAD `speech_start` event, including the ones suppressed during the per-turn warmup gate (`_can_barge_in() == False`). With AEC enabled this is a ~1 s window; without AEC it is the 250 ms anti-flicker margin. Background noise / echo / agent self-loopback during that window emitted a `speech_start` that was correctly suppressed for the barge-in path BUT silently stamped `_turn_start` at the bleed-through instant. The legitimate user `speech_start` that fired seconds later then no-op'd because `start_turn_if_idle` only acts when `_turn_start is None`. Result: `user_speech_duration_ms = (endpoint_signal_at − stale_turn_start) * 1000`, often 5-7 s.
+
+2. **Stale `_endpoint_signal_at` across dropped final transcripts** — when a final transcript arrived but `commitTranscript` / `_commit_transcript` returned False (dedup window / rejected barge-in / `afterTranscribe` veto, e.g. the "Okay." swallow on a strategy-pending barge-in), the previously-stamped VAD-end anchor was never cleared. The NEXT legitimate utterance inherited that stale anchor, so its `endpoint_ms` measured the silence gap between the dropped utterance and the real one.
+
+Both classes fixed with a single new metrics primitive and two call-site swaps:
+
+- **`anchor_user_speech_start()` (Python) / `anchorUserSpeechStart()` (TypeScript)** — Pipecat-style "every legitimate VAD `speech_start` re-anchors the turn pre-commit". Resets `_turn_start`, `_endpoint_signal_at`, `_vad_stopped_at`, `_stt_final_at`, `_stt_complete`, `_llm_first_token`, and the TTFB-emitted guard. No-ops once `_turn_committed_mono` is set (post-commit barge-ins follow the existing `record_turn_interrupted` path). Files: `libraries/python/getpatter/services/metrics.py`, `libraries/typescript/src/metrics.ts`.
+
+- **`stream_handler.py` / `stream-handler.ts` VAD `speech_start` handler** — explicit `phantom_suppressed` boolean gates ALL metrics state mutation: suppressed events log only, legitimate events call `anchor_user_speech_start()` instead of the old `start_turn_if_idle()`. The strategy-pending barge-in branch also switched from `start_turn_if_idle` to the new primitive so re-anchoring happens consistently on every legitimate `speech_start`.
+
+- **Dropped-final-transcript reset** — when `commitTranscript`/`_commit_transcript` returns False on an `is_final` / `speech_final` transcript, the same `anchor_user_speech_start()` is invoked so the discarded utterance's anchors don't leak into the next turn.
+
+### Fixed — Cartesia STT `finalize()` exposed so VAD `speech_end` can force-flush (Python + TypeScript parity)
+
+The 0.5.5 fast-path at `stream_handler.py:3070-3077` ("on VAD `speech_end`, call `stt.finalize()` so the provider doesn't wait for its natural-pause heuristic") was a no-op for Cartesia: `CartesiaSTT` only sent the `finalize` text frame from its private `close()` method on session shutdown, and `getattr(self._stt, "finalize", None)` returned None. The SDK's authoritative VAD silence detection (SileroVAD, 250 ms threshold) was being overridden by Cartesia's conservative internal endpointing (observed 2-7 s on PSTN audio with background hiss).
+
+Added `async finalize()` to both `CartesiaSTT` (Python) and `CartesiaSTT` (TypeScript) that sends the canonical `finalize` text frame on the live WebSocket. The wired-but-no-op fast-path now triggers a deterministic VAD-driven STT finalisation, parity with Deepgram. Files: `libraries/python/getpatter/providers/cartesia_stt.py`, `libraries/typescript/src/providers/cartesia-stt.ts`.
+
+### Fixed — Cerebras pricing table overcharged 1.5-2.4x across multiple models (Python + TypeScript parity)
+
+Audited against the canonical per-model docs pages at `https://inference-docs.cerebras.ai/models/<model>`. Patter's 2026-05-08 table conflated launch-blog quotes with the current "Exploration pricing" banner shown on each model docs page. Corrections:
+
+| Model | Old (in/out) | New (in/out) | Source |
+|-------|--------------|--------------|--------|
+| `gpt-oss-120b` | $0.85 / $1.20 | $0.35 / $0.75 | inference-docs.cerebras.ai/models/openai-oss |
+| `llama3.1-8b` | $0.10 / $0.20 | $0.10 / $0.10 | inference-docs.cerebras.ai/models/llama-31-8b |
+| `qwen-3-235b-a22b-instruct-2507` | $1.00 / $1.50 | $0.60 / $1.20 | inference-docs.cerebras.ai/models/qwen-3-235b-2507 |
+| `qwen-3-coder-480b` | (missing → $0) | $2.00 / $2.00 | cerebras.ai/blog/qwen3-coder-480b |
+
+Pre-fix a 5-turn pipeline call against the Patter-default `gpt-oss-120b` logged ~$0.000117 in `cost.llm` instead of the actual ~$0.000088 — over-reporting by a factor of ~1.3. Net: customers were never undercharged, but the dashboard line item was wrong (and 50% high for `gpt-oss-120b` specifically). Files: `libraries/python/getpatter/pricing.py`, `libraries/typescript/src/pricing.ts`. Tests updated at `libraries/python/tests/test_pricing.py`.
+
+### Fixed — Dashboard cost rendering flattened sub-cent values to `$0.00` (`fmtCostUSD` adaptive precision)
+
+The dashboard's per-row, per-stack, and aggregate spend tiles all used `toFixed(2)` or `toFixed(3)` for USD rendering. Cerebras `gpt-oss-120b` at $0.0001 / 5-turn-call rounds to `$0.00` under that rule, making the LLM cost line look as if billing was broken when in fact it was working end-to-end (token usage extracted from the streaming `usage` chunk, cost calculated, persisted to `metadata.json` at the correct precision).
+
+Added `fmtCostUSD(value)` helper (`dashboard-app/src/components/format.ts`) with magnitude-adaptive precision: ≥$0.01 → 2 decimals, ≥$0.001 → 3 decimals, ≥$0.0001 → 4 decimals, smaller values → 5 decimals. Applied across all 12 cost render sites (`App.tsx` spend tile, `CallTable.tsx` row total, `Metric.tsx` headline + per-call row, `CostPanel.tsx` × 5, `MetricsPanel.tsx` × 4). A 5-turn Cerebras pipeline call now shows `$0.00012` instead of `$0.00`.
+
+### Fixed — Dashboard latency metrics: real percentiles, correct waterfall, n<5 percentile gate
+
+The "Latency · this call" panel was showing three different numbers labelled wrong:
+1. **"p50" was the avg of total_ms**, not the median (`mappers.ts:194` read `latencyP50: latencyAvg.total_ms`).
+2. **The "llm" bar in the waterfall was the same fake p50**, double-counting non-LLM time (waterfall `llm = call.latencyP50` instead of `avg(llm_ms)`). The bar was off by ~5x on real PSTN data.
+3. **p50/p95 were rendered with as few as 1 turn**, where percentiles are statistical noise (linear interpolation between two samples).
+
+Round-trip `total_ms` also includes the user-utterance duration on the speech-to-speech metric, which over-states user-perceived latency. The dashboard now exposes `agent_response_ms` (wait time after the user stops speaking) as a separate primary metric.
+
+Fixes shipped:
+- **SDK serialization** (`libraries/python/getpatter/server.py`, `libraries/typescript/src/server.ts`) — `metadata.json` now persists the full `LatencyBreakdown` per percentile (`avg`, `p50`, `p95`, `p99`) with all components (`stt_ms`, `llm_ms`, `tts_ms`, `total_ms`, `agent_response_ms`, `endpoint_ms`, `user_speech_duration_ms`). The flat `p50_ms / p95_ms / p99_ms` totals are kept for backward-compat with consumers that read only summaries.
+- **Dashboard hydrate** (`libraries/python/getpatter/dashboard/store.py`, `libraries/typescript/src/dashboard/store.ts`) — `_metrics_from_top_level` reads the full breakdown when present; falls back to the synthetic single-`total_ms` shim only for legacy metadata that lacked the breakdown.
+- **Dashboard UI** (`dashboard-app/src/lib/api.ts`, `mappers.ts`, `components/CallTable.tsx`, `components/LatencyPanel.tsx`, `components/MetricsPanel.tsx`) — `Call` gains `llmAvg`, `turnCount`, `agentResponseP50/P95`. `latencyP50` now reads from `latency_p50.total_ms` (true median); the waterfall `llm` bar uses `llmAvg`. Percentile boxes render `—` and a "n turns — percentiles need ≥5" hint when `turnCount < 5`. The Latency panel adds a `p50 wait / p95 wait` pair sourced from `agent_response_ms`, the user-perceived "time waited after I stopped speaking" metric.
+
+Backward compat: legacy `metadata.json` (no `avg/p50/p95/p99` objects, only flat percentiles) still hydrates — those rows just lack the per-component breakdown in the panel and show `—` for `p50 wait / p95 wait`. No public API change.
+
+### Changed — First-turn cold-start: keep prewarmed WebSockets OPEN and adopt them at call connect (Python + TypeScript parity)
+
+Investigation of live PSTN-pipeline first-turn p95 latency (~3 s observed in production acceptance) showed the existing prewarm pattern (open WS, idle ~250 ms, close) saves only ~50-250 ms — DNS cache + edge-worker pinning at best. The dominant first-turn cost on PSTN pipeline is the synchronous TLS + WS-upgrade + protocol-handshake against STT (~150-400 ms) and TTS (~400-900 ms) when the call starts. Opening + closing a WS does NOT thread `session: <previousTicket>` across `new WebSocket()` calls in Node's `ws` package (and Python's `websockets` library has the same property at the TCP / TLS level), so each fresh open re-pays the full handshake.
+
+Structural fix: the prewarm pipeline now keeps each provider WebSocket OPEN during the carrier ringing window and hands the live socket off to the per-call `StreamHandler` at `start`, skipping the cold handshake entirely on the first turn.
+
+- **`Patter._prewarmed_connections` (Python) / `Patter.prewarmedConnections` (TS)** — new per-call_id cache holding pre-opened, fully-handshaked provider WebSockets. Populated by the new `_park_provider_connections(agent, call_id)` (Py) / `parkProviderConnections(agent, callId)` (TS), which runs in parallel with the carrier-side `initiate_call`. Each parked slot may hold up to three handles (`stt`, `tts`, `openai_realtime`); each is consumed exactly once. A 30 s safety TTL force-closes any slot whose carrier never fires `start`. Drained by `pop_prewarmed_connections(call_id)` on `start` (consumes the handles into the StreamHandler), `close_prewarmed_connections(call_id)` on call-failure paths (no-answer / busy / failed / canceled / AMD voicemail — wired through `_record_prewarm_waste`), and `disconnect()` on Patter teardown. Files: `libraries/python/getpatter/client.py` (cache + park task + helpers + helpers `_safe_close_handle`, `_close_parked_slot`), `libraries/typescript/src/client.ts` (parity, plus the new exported `ParkedProviderConnections` interface).
+
+- **Provider-level `open_parked_connection()` and `adopt_websocket(...)`** shipped on the three streaming providers most-affected by the cold-start cost: `CartesiaSTT`, `ElevenLabsWebSocketTTS`, `OpenAIRealtimeAdapter`. `open_parked_connection` opens the WS, sends the EXACT initial config the live `connect()` / `synthesize()` path sends (BOS frame for ElevenLabs WS, `session.update` round-trip for OpenAI Realtime), then returns the OPEN socket WITHOUT arming any recv / keepalive task — the handle is parked. `adopt_websocket` takes that handle, installs the recv + keepalive plumbing, and hands the live socket back to `StreamHandler` as if `connect()` had just finished. The TTS adapter uses a single-slot adoption queue so the existing `for await (const chunk of agent.tts.synthesizeStream(...))` call site continues to work without signature changes — and the BOS-already-sent flag prevents a protocol error on adoption. Files: `libraries/python/getpatter/providers/{cartesia_stt,elevenlabs_ws_tts,openai_realtime}.py`, `libraries/typescript/src/providers/{cartesia-stt,elevenlabs-ws-tts,openai-realtime}.ts`.
+
+- **`StreamHandler` adopt-or-connect** — the pipeline-mode initialisation path now polls `pop_prewarmed_connections(call_id)` BEFORE `stt.connect()` / TTS firstMessage. When a parked WS is still OPEN it is adopted (logged as `[CONNECT] callId=... source=adopted ms=0`); when the parked WS died between park and adopt (server timeout, network blip), the dead handle is discarded silently and the consumer falls back to a fresh `connect()` (logged as `source=fresh ms=<elapsed>`). When no parked slot exists at all (cache miss, prewarm task slower than carrier ringing, prewarm disabled), the path is byte-identical to the prior cold-start flow — backward-compatible. Realtime adapter adoption (separate `OpenAIRealtimeStreamHandler` code path) ships the API surface but is not yet wired through the realtime stream handler — pipeline mode dominates the affected use case and the realtime wiring is a follow-up. Files: `libraries/python/getpatter/stream_handler.py`, `libraries/typescript/src/stream-handler.ts`.
+
+### Fixed — Parallelise STT.connect with TTS firstMessage kickoff (Python + TypeScript parity)
+
+Pipeline-mode initialisation previously did `await stt.connect()` then `tts.synthesizeStream(firstMessage)` serially. STT only needs to be ready to receive incoming user audio, not to send the first agent message out — running the two in parallel saves an additional 200-400 ms on the first turn (real cost of a Deepgram / Cartesia / AssemblyAI WS upgrade). The STT receive loop launcher now awaits the deferred connect task before installing the message pump, so a half-open WS never surfaces "Not connected" on the first audio frame. Files: `libraries/python/getpatter/stream_handler.py`, `libraries/typescript/src/stream-handler.ts`.
+
+### Fixed — Pre-import AEC module at `Patter.serve()` (Python + TypeScript parity)
+
+The acoustic echo canceller (`getpatter.audio.aec.NlmsEchoCanceller`) was lazily imported on the first call when `agent.echo_cancellation=True`, costing ~150-400 ms of dynamic-import compile / link on the hot path. `Patter.serve()` now eagerly imports the module once when `echo_cancellation` is enabled, so the first call sees the cache-warm import. Pure data — no side effects on users who never enable AEC. Files: `libraries/python/getpatter/client.py`, `libraries/typescript/src/client.ts`.
+
+### Fixed — `[PREWARM]` and `[CONNECT]` timing instrumentation (Python + TypeScript parity)
+
+INFO-level log lines added to `_park_provider_connections` and the StreamHandler adopt-or-connect path so operators can attribute first-turn latency to specific providers without strace / packet capture. Format: `[PREWARM] callId=<id> provider=stt ms=<elapsed_to_park>`, `[CONNECT] callId=<id> provider=stt source=adopted|fresh ms=<connect_time>`. Files: `libraries/python/getpatter/client.py` + `stream_handler.py`, `libraries/typescript/src/client.ts` + `stream-handler.ts`.
+
+Tests: `libraries/python/tests/test_prewarm_handoff.py` (6 unit tests — park task invokes `open_parked_connection` on STT + TTS, parked WS stays OPEN past 250 ms, `pop_prewarmed_connections` consumes once, `close_prewarmed_connections` and `_record_prewarm_waste` drain parked sockets, no-op when neither provider supports parking) and `libraries/typescript/tests/unit/prewarm-handoff.test.ts` (6 parity tests). Both suites use authentic real code paths — only the WS handle is stubbed (it has no business in a unit test) — per `.claude/rules/authentic-tests.md`. Defaults preserved: `agent.prewarm` is still `true` by default, all existing tests pass without modification, and providers that do not implement `open_parked_connection` (everything except the three above) fall through to the prior `warmup()`-then-cold-`connect()` flow.
+
+### Fixed — Prewarm-firstMessage cache safety (5 issues, Python + TypeScript parity)
+
+The `Agent.prewarm_first_message` opt-in shipped earlier in 0.6.1 had five edge cases where the TTS bill was paid but the cached bytes either leaked, never reached the wire, or silently wasted spend. Each fix is per FIX number from the parity audit. Defaults preserved across the board: cap = 200 concurrent prewarmed calls, TTL = `ring_timeout + 5 s`. Tests added in `libraries/python/tests/test_prewarm.py` (14 new tests) and `libraries/typescript/tests/unit/prewarm.test.ts` + `libraries/typescript/tests/unit/server-routes.test.ts` (12 new tests).
+
+- **FIX #91 — cache eviction on abnormal hangup.** `_record_prewarm_waste` was only called from `Patter.end_call(call_sid)`. When a call went to `no-answer` / `busy` / `failed` / `canceled` (Twilio) or hit `call.hangup` / AMD voicemail (Telnyx), the `_prewarm_audio[call_id]` entry leaked until the user explicitly invoked `end_call`. Twilio status callback handler now invokes `record_prewarm_waste` for the four abnormal `CallStatus` values and on the AMD `machine_end_*` paths; Telnyx webhook handler now does the same on `call.hangup` (any `hangup_cause`) and on `call.machine.detection.ended` with `result == "machine"`. `_record_prewarm_waste` is now idempotent — the `_prewarm_consumed` set is checked first, so the status callback firing before `end_call` (or vice-versa) does not double-WARN. Files: `libraries/python/getpatter/server.py` (status / AMD / call.hangup branches), `libraries/python/getpatter/client.py` (`_record_prewarm_waste` idempotency guard, `_prewarm_consumed` set, server forwarding), `libraries/typescript/src/server.ts` (parity), `libraries/typescript/src/client.ts` (parity).
+
+- **FIX #92 — race start-vs-prewarm-task → orphan bytes.** When the carrier's `start` event arrived BEFORE the prewarm TTS task completed, `pop_prewarm_audio` returned `None`, the `StreamHandler` correctly fell back to live TTS, BUT the prewarm task continued in the background and eventually wrote bytes to `_prewarm_audio[call_id]` — orphaning them in the cache until `end_call` ran. Combined with FIX #91, every fast-pickup call leaked the prewarm bytes. **Option A (race-guard)** chosen for the minimum-fix bound. New `_prewarm_consumed: set[str]` tracks every `pop_prewarm_audio` call (hit OR miss). The prewarm task checks membership before writing bytes; on race-finish, the bytes are dropped and a WARN names the `call_id` plus byte count so the wasted spend is observable. Option B (200 ms wait window for the synth to land) was rejected as adding more latency-coupled state for marginal recovery. Files: `libraries/python/getpatter/client.py` (`_spawn_prewarm_first_message._run`), `libraries/typescript/src/client.ts` (parity).
+
+- **FIX #93 — `disconnect()` did not clean up prewarm.** Across `serve()` → `disconnect()` → `serve()` cycles within the same `Patter` instance, in-flight `_prewarm_tasks` continued to run (the TTS WebSocket stayed open and billed) and stale `_prewarm_audio` entries leaked. `disconnect()` now cancels every task in `_prewarm_tasks`, `await`s the cancellation via `asyncio.gather(..., return_exceptions=True)` (Py) / `Promise.allSettled` with a 1 s safety timeout (TS), cancels any pending TTL eviction tasks, and clears `_prewarm_audio` + `_prewarm_consumed`. The instance is fully reusable: a follow-up `serve()` sees a clean cache. Files: `libraries/python/getpatter/client.py` (`Patter.disconnect`), `libraries/typescript/src/client.ts` (parity).
+
+- **FIX #94 — Realtime/ConvAI silently waste TTS spend.** `agent.prewarm_first_message=True` paired with `agent.provider="openai_realtime"` or `"elevenlabs_convai"` paid the TTS bill on every outbound call but never streamed the cached bytes — the `StreamHandler` for those modes runs the firstMessage emit through the provider's own audio path, never consulting `pop_prewarm_audio`. `Patter.call` now checks the provider mode at `_spawn_prewarm_first_message` entry; when `provider != "pipeline"` it logs a WARN and refuses to spawn the synth task. Both SDK docstrings (`Agent.prewarm_first_message`, `AgentOptions.prewarmFirstMessage`) updated to document the constraint. Files: `libraries/python/getpatter/client.py`, `libraries/python/getpatter/models.py` (docstring), `libraries/typescript/src/client.ts`, `libraries/typescript/src/types.ts` (JSDoc).
+
+- **FIX #96 — prewarm cache unbounded (memory DoS).** A flood of `Patter.call(...)` invocations (legitimate or attacker-controlled) could pile up tens of MB of orphan TTS bytes that never evicted when the carrier never fired `start`. Two bounds added: (a) **size cap** at `_PREWARM_CACHE_MAX = 200` (Py) / `PREWARM_CACHE_MAX = 200` (TS) concurrent entries (live cache + in-flight synth tasks). When the cap is reached, new prewarm spawns are refused with a WARN and the call still proceeds — only the optimisation is skipped. (b) **TTL eviction**: a per-entry timer scheduled `ring_timeout + _PREWARM_TTL_GRACE_S` (default 5 s) after the synth task completes. If the cache entry is still present when the timer fires, it is dropped and a WARN names the byte count. The timer is cancelled on normal consumption (`pop_prewarm_audio`) and on `_record_prewarm_waste`, so spurious WARNs never fire after a clean drain. Both `_PREWARM_CACHE_MAX` and `_PREWARM_TTL_GRACE_S` (Py) / `PREWARM_CACHE_MAX` and `PREWARM_TTL_GRACE_MS` (TS) are exported as module-level constants for tests and operator visibility. Files: `libraries/python/getpatter/client.py` (cap check + TTL eviction in `_spawn_prewarm_first_message`, `_evict_prewarm_after`), `libraries/typescript/src/client.ts` (parity).
+
+### Changed — Concrete STT/TTS WebSocket prewarm overrides + OpenAI Realtime native warmup (Python + TypeScript parity)
+
+The first prewarm pass (above) shipped LLM HTTPS-GET warmup but left STT and TTS providers on the no-op default. A second look at the cold-start latency budget revealed a priority inversion: an HTTPS GET against an LLM `/models` endpoint warms only DNS + TLS + connection pool — it does NOT prime the inference path itself, while a streaming-STT or streaming-TTS WebSocket pre-handshake (full TLS + auth + initial config exchange) saves 200-500 ms per call on cold start. OpenAI's Realtime API exposes a native warmup primitive (`response.create` with `generate: false`) that prepares request state without billing tokens. This entry rebalances the prewarm pipeline to put the wins where they actually live.
+
+- **STT WebSocket prewarms** — concrete `warmup()` overrides shipped on `DeepgramSTT`, `CartesiaSTT`, and `AssemblyAISTT`. Each opens the streaming WebSocket (full DNS + TLS + auth handshake), idles ~250 ms so the provider edge keeps the session warm in its routing table, then closes cleanly. By the time `connect()` is invoked at call-pickup the resolver and TLS session are hot — net wire time saving of 200-500 ms vs a cold WS open. **Billing safety**: all three providers bill on streamed audio seconds (Deepgram per [pricing](https://deepgram.com/pricing); Cartesia per [STT API reference](https://docs.cartesia.ai/2025-04-16/api-reference/stt/stt); AssemblyAI per [pricing](https://www.assemblyai.com/pricing)). Opening + closing the WebSocket without sending any audio frames does not consume billable seconds. The override docstrings reference the per-provider billing model so future contributors don't accidentally regress this. Files: `libraries/python/getpatter/providers/{deepgram_stt,cartesia_stt,assemblyai_stt}.py`, `libraries/typescript/src/providers/{deepgram-stt,cartesia-stt,assemblyai-stt}.ts`.
+
+- **TTS prewarms — WebSocket and HTTP** — concrete `warmup()` overrides shipped on `ElevenLabsWebSocketTTS` (WS), `CartesiaTTS` (HTTP `/tts/bytes`), and `InworldTTS` (HTTP `/tts/v1/voice:stream`). The ElevenLabs WS variant opens the stream-input WebSocket, sends the protocol-required single-space keepalive `{"text": " "}` so the server creates and warms the session, idles ~250 ms, then closes. The HTTP-only providers (Cartesia, Inworld) issue a lightweight `GET /voices` (Cartesia) or `HEAD` against the streaming base host (Inworld) to warm DNS + TLS + HTTP/2 — smaller win (~50-150 ms) than the WS variant (~200-500 ms) but still real on cold-start calls. **Billing safety**: ElevenLabs bills on synthesised characters delivered via `audio` frames (per [pricing](https://elevenlabs.io/pricing)) — the keepalive primer is the documented session-establishment frame and does NOT commit synthesis (no `flush: true`, no real text). Cartesia `GET /voices` is a free metadata read; Inworld `HEAD` does not invoke the synthesis pipeline. Tests in both SDKs explicitly assert no `flush: true`, no audio frames, and no synthesis POST during warmup. Files: `libraries/python/getpatter/providers/{elevenlabs_ws_tts,cartesia_tts,inworld_tts}.py`, `libraries/typescript/src/providers/{elevenlabs-ws-tts,cartesia-tts,inworld-tts}.ts`.
+
+- **OpenAI Realtime native warmup (`response.create` with `generate: false`)** — concrete `warmup()` override shipped on `OpenAIRealtimeAdapter`. Per OpenAI's documented [websocket-mode warmup pattern](https://developers.openai.com/api/docs/guides/websocket-mode), the canonical warm step on the Realtime API is to open a session and send `response.create` with `response.generate=false` — this prepares the model's request state and primes inference far more effectively than a generic HTTPS GET. Implementation: open the WS, wait for `session.created`, send `{"type": "response.create", "response": {"generate": false}}`, capture the `response.id` from the resulting `response.created` event into `self._prewarm_response_id` (Py) / `this.prewarmResponseId` (TS), then close. The id is stored so a future call can chain it as `previous_response_id` when the chaining path is wired through `connect()`; for now we capture-and-discard, taking half the win (priming the global session state) without the cross-session-state plumbing complexity. **Billing safety**: `response.create` with `generate: false` is documented as a no-token warmup variant that does not invoke the model — no per-token cost is accrued. Files: `libraries/python/getpatter/providers/openai_realtime.py`, `libraries/typescript/src/providers/openai-realtime.ts`.
+
+- **LLM HTTP-GET warmup retained but documented as low-impact** — the existing `OpenAILLMProvider.warmup` (and its Anthropic / Google / Cerebras / Groq subclasses) still issues a 5 s-bounded `GET <base_url>/models` to warm DNS + TLS + connection pool, saving ~150-400 ms on cold start. The docstring on the base implementation now explicitly calls out that an HTTPS GET does NOT warm the inference path itself — for true inference warmup a real low-token request is needed, left as a follow-up. STT / TTS WebSocket prewarms (above) dominate the cold-start latency budget. Files: `libraries/python/getpatter/services/llm_loop.py`, `libraries/typescript/src/llm-loop.ts`.
+
+Tests: `libraries/python/tests/unit/test_provider_warmup.py` (14 unit tests — Deepgram / Cartesia / AssemblyAI / ElevenLabs WS / Cartesia TTS / Inworld / OpenAI Realtime each verified for: warmup completes, WS opened + closed, no audio / no synthesis-commit frames sent during warmup, errors swallowed at DEBUG) and `libraries/typescript/tests/unit/provider-warmup.mocked.test.ts` (15 parity tests). Tests are tagged `@pytest.mark.mocked` (Py) / filename `*.mocked.test.ts` (TS) per `.claude/rules/authentic-tests.md` — only the network boundary is mocked; protocol negotiation, URL construction, and the warmup logic itself run real code. Defaults preserved: `agent.prewarm` is still `true` by default, warmup remains a no-op for unmodified custom providers, and existing tests pass without modification.
+
+### Added — Pre-warm and pre-synth firstMessage (Python + TypeScript parity)
+
+Cold-start latency on the first turn of an outbound call is dominated by DNS / TLS / HTTP-keepalive handshakes against the LLM and TTS providers (typical: 200-700 ms TTS first-byte plus 150-400 ms LLM connection setup, on top of the carrier's 3-15 s ringing window). The `Agent.prewarm` and `Agent.prewarm_first_message` flags let `Patter.call(...)` reclaim that lost latency by working in parallel with the carrier-side `initiate_call`.
+
+- **`Agent.prewarm: bool = True`** (Python) / **`agent.prewarm?: boolean`** (TypeScript, default `true` when undefined). When `True`, `Patter.call` spawns a fire-and-forget task that invokes the optional `warmup()` method on the configured STT, TTS, and LLM providers in parallel via `asyncio.gather(..., return_exceptions=True)` (Python) / `Promise.allSettled` (TS). Built-in LLM providers ship a real warmup that issues a 5 s-bounded HTTPS `GET /models` to the upstream — OpenAI (`https://api.openai.com/v1/models`), Anthropic (`https://api.anthropic.com/v1/models`), Google (`https://generativelanguage.googleapis.com/v1beta/models`), Cerebras (`https://api.cerebras.ai/v1/models`), Groq (`https://api.groq.com/openai/v1/models`). STT and TTS providers inherit a no-op default; concrete providers can override `async warmup() -> None` (Python ABC) / `warmup?(): Promise<void>` (TS interface) to prime their own connections. Failures are logged at DEBUG and never abort the call — the feature is pure latency optimisation. Files: `libraries/python/getpatter/providers/base.py` (default `warmup` on `STTProvider`, `TTSProvider`), `libraries/python/getpatter/services/llm_loop.py` (`OpenAILLMProvider.warmup`), `libraries/python/getpatter/providers/anthropic_llm.py`, `libraries/python/getpatter/providers/google_llm.py`, `libraries/python/getpatter/client.py` (`Patter._spawn_provider_warmup`), `libraries/typescript/src/llm-loop.ts` (`LLMProvider.warmup` optional + `OpenAILLMProvider.warmup`), `libraries/typescript/src/providers/cerebras-llm.ts`, `libraries/typescript/src/providers/groq-llm.ts`, `libraries/typescript/src/providers/anthropic-llm.ts`, `libraries/typescript/src/providers/google-llm.ts`, `libraries/typescript/src/provider-factory.ts` (`STTAdapter.warmup`, `TTSAdapter.warmup` optional), `libraries/typescript/src/client.ts` (`Patter.spawnProviderWarmup`).
+
+- **`Agent.prewarm_first_message: bool = False`** (Python) / **`agent.prewarmFirstMessage?: boolean = false`** (TypeScript). Off by default to preserve the prior cost surface. When `True`, after `Patter.call` resolves the carrier-issued `call_id` it spawns a background task that calls `agent.tts.synthesize(agent.first_message)` (Python) / `agent.tts.synthesizeStream(agent.firstMessage)` (TS), accumulates the bytes, and stores the buffer in `Patter._prewarm_audio[call_id]` / `Patter.prewarmAudio.set(callId, buffer)`. The synth is bounded by `ring_timeout` (default 25 s) so a never-answered call can't tie up the TTS connection. The per-call `StreamHandler` (`PipelineStreamHandler` Python / `StreamHandler.runPipeline` TS) now checks the cache via `pop_prewarm_audio(call_id)` / `popPrewarmAudio(callId)` at the start of the firstMessage emit; on a cache hit the buffer is sent directly through the carrier-side audio sender (which handles native-rate → carrier-rate resampling identically to the live TTS path), the `tts.synthesize` round-trip is skipped, and TTS first-byte latency drops to ~0 ms. **Cost implication**: the TTS bill for `agent.first_message` is paid as soon as the synth task completes, even when the call is never answered (no-answer / busy / AMD voicemail). When the call ends without consuming the cache, `Patter.end_call` / `Patter.endCall` log a WARN naming the wasted call_id and approximate byte count so operators see the cost surface explicitly. Files: `libraries/python/getpatter/client.py` (`Patter._prewarm_audio`, `pop_prewarm_audio`, `_record_prewarm_waste`, `_spawn_prewarm_first_message`), `libraries/python/getpatter/server.py` (`EmbeddedServer.pop_prewarm_audio` forward), `libraries/python/getpatter/telephony/twilio.py` + `telnyx.py` (bridge accepts `pop_prewarm_audio`), `libraries/python/getpatter/stream_handler.py` (`PipelineStreamHandler` consumes cache in firstMessage emit), `libraries/typescript/src/client.ts` (`Patter.prewarmAudio`, `popPrewarmAudio`, `recordPrewarmWaste`, `spawnPrewarmFirstMessage`), `libraries/typescript/src/server.ts` (`EmbeddedServer.popPrewarmAudio`), `libraries/typescript/src/stream-handler.ts` (`StreamHandlerDeps.popPrewarmAudio`, firstMessage emit consumes cache).
+
+Tests: `libraries/python/tests/test_prewarm.py` (14 unit tests covering default flag values, no-op default `warmup`, all-three-providers warmup invocation, opt-out via `prewarm=False`, exception swallow at DEBUG, cache populate / skip / empty-message / timeout, one-shot pop semantics, waste-warn log, StreamHandler cache-hit short-circuit + cache-miss live-TTS fallback) and `libraries/typescript/tests/unit/prewarm.test.ts` (11 parity tests). Both suites use authentic real code paths — only the network boundary is exercised through stubs — per `.claude/rules/authentic-tests.md`. Defaults preserved: `agent.prewarm` is `true` and warmup is a no-op for unmodified providers, so existing tests pass without modification; `agent.prewarm_first_message` is `false`, so the new TTS-bill cost surface is strictly opt-in.
+
+### Changed — Dashboard: STT and TTS rendered as separate cost rows
+
+The cost breakdown panel previously combined STT and TTS spend into a single "STT / TTS" line, which hid which side of the audio pipeline dominated cost. The two providers are typically distinct (e.g. Cartesia STT + ElevenLabs TTS) and bill at very different rates per second of audio. The panel now renders them as two adjacent rows labeled with the actual provider name (e.g. "Cartesia STT" / "ElevenLabs TTS"), driven by `record.metrics.stt_provider` / `tts_provider` already exposed by the backend. The legacy `CallCostUi.sttTts` field is kept in `dashboard-app/src/lib/mappers.ts` for the few aggregate-spend callers (`callSpend`, totals bar) and is now derived as `stt + tts` after both granular fields are populated. Files: `dashboard-app/src/lib/mappers.ts`, `dashboard-app/src/components/CostPanel.tsx`.
+
+### Changed — `stt_ms` is now finalization-only (Python + TypeScript parity)
+
+⚠️ Semantic change to `LatencyBreakdown.stt_ms`. Previously the value measured `stt_complete - turn_start`, which conflated user speech duration with STT processing — a 5 s utterance produced `stt_ms ≈ 5000` even when Cartesia / Deepgram finalized in 200 ms after end-of-speech. The legacy interpretation was misleading: industry benchmarks (Picovoice, Deepgram, Gladia, Speechmatics, Daily.co) all report STT latency as the **finalization window** — `final_transcript - end_of_speech` — independent of how long the user spoke. `stt_ms` now matches that definition: it measures from the endpoint signal (VAD `speech_stop` or STT `speech_final`, whichever comes first) to the final transcript delivery. When the endpoint signal is unavailable (degraded provider, batch STT) the metric falls back to the legacy `turn_start` anchor so dashboards never see a spuriously zero value.
+
+A new optional field `LatencyBreakdown.user_speech_duration_ms` (`userSpeechDurationMs` over the wire stays `user_speech_duration_ms` for SDK parity) carries the displaced "how long did the user speak" number, populated only when the endpoint signal is present. Together with the existing `agent_response_ms` (silence detection + LLM TTFT + TTS first-byte) and `total_ms` (turn_start → first agent audio byte), the breakdown now cleanly separates the four orthogonal slices a voice-AI dashboard needs: utterance length, STT finalization, LLM TTFT, TTS first-byte. Files: `libraries/python/getpatter/models.py`, `libraries/python/getpatter/services/metrics.py`, `libraries/typescript/src/metrics.ts`.
+
+### Added — OTel `patter.*` span attributes (Python only; TS parity follow-up)
+
+⚠️ Parity gap: this lands in the Python SDK only. TypeScript follow-up is tracked separately and will land in a subsequent release. Per `.claude/rules/sdk-parity.md` every public feature must reach both SDKs; this is a known time-boxed exception.
+
+- **`getpatter.observability.attributes`** — three new helpers added: `record_patter_attrs(attrs)`, `patter_call_scope(call_id, side)` (context manager), and `attach_span_exporter(patter, exporter, side)`. Lazy-OTel-guarded; no-op when the `[tracing]` extra is not installed. Two ContextVars (`patter.call_id`, `patter.side`) propagate through the asyncio task tree so spans emitted by deeply nested provider code inherit the active call's identity automatically. File: `libraries/python/getpatter/observability/attributes.py`. The three symbols are re-exported from `getpatter.observability` for direct import.
+- **`Patter._attach_span_exporter(exporter, *, side="uut")`** — public-but-underscore hook for tools that observe Patter from outside (e.g. an out-of-process agent runner). Default `side="uut"` preserves all existing behaviour. The leading underscore signals it is not part of the customer-facing API surface. File: `libraries/python/getpatter/client.py`.
+- **Per-provider cost emission (19 surfaces)** — `patter.cost.{telephony_minutes, stt_seconds, tts_chars, llm_input_tokens, llm_output_tokens, realtime_minutes}` are now stamped on the active span across the provider lineup (Twilio + Telnyx telephony adapters; Deepgram, AssemblyAI, Whisper, OpenAI Transcribe, Soniox, Speechmatics, Cartesia STT; ElevenLabs, OpenAI, Cartesia, LMNT, Rime TTS; OpenAI/Anthropic/Google/Groq/Cerebras LLM; OpenAI Realtime + ElevenLabs ConvAI realtime). Provider tag emitted alongside as `patter.{telephony,stt,tts,llm,realtime}.provider`. All call sites are wrapped in defensive `try/except` so observability cannot kill a live call.
+- **Per-turn latency** — `patter.latency.{ttfb_ms, turn_ms}` stamped from `StreamHandler._emit_turn_metrics` via a new `PipelineHookExecutor.record_turn_latency(*, ttfb_ms, turn_ms)` method. `ttfb_ms` maps to `total_ms` (turn-start → first TTS audio byte, the user-perceptible TTFB); `turn_ms` maps to `tts_total_ms` and falls back to `total_ms` when null. Files: `libraries/python/getpatter/services/pipeline_hooks.py`, `libraries/python/getpatter/stream_handler.py`.
+- **`patter_call_scope` enters at the bridge level** so the entire WebSocket bridge lifetime — including hangup / cleanup — is bound to `patter.call_id` and `patter.side`. The scope is opened on the Twilio `start` / Telnyx `streaming.started` event (when the call_id is known) and closed in the `finally:` block via `contextlib.ExitStack`, so cleanup-emitted spans (handler.cleanup, telephony cost queries, on_call_end) inherit the call identity. Files: `libraries/python/getpatter/telephony/twilio.py`, `libraries/python/getpatter/telephony/telnyx.py`.
+- **`TwilioAdapter.record_call_end_cost` / `TelnyxAdapter.record_call_end_cost`** — adapter-level helpers used by the bridge to emit `patter.cost.telephony_minutes` once the call's wall-clock duration is known. Files: `libraries/python/getpatter/providers/twilio_adapter.py`, `libraries/python/getpatter/providers/telnyx_adapter.py`.
+- **Docs**: `docs/python-sdk/tracing.mdx` updated with a new "Cost and latency attributes (`patter.*`)" section and an "Attach a custom exporter" example showing how to wire `Patter._attach_span_exporter` to an `InMemorySpanExporter` for tests or to an `OTLPSpanExporter` in production.
+
+### Added — Opt-in barge-in confirmation strategies (Python + TypeScript)
+
+- **Opt-in barge-in confirmation strategies** (Python + TypeScript parity, fully backward-compatible). Cloud TTS providers take 200-700 ms to emit the first audio byte and PSTN background noise routinely fires VAD before any real interruption is happening; the legacy "any VAD speech_start during TTS cancels the agent" contract therefore produced frequent false-positive cancels — the agent was cut by cough/click/HVAC/breath and lost the conversational thread. The new ``Agent.barge_in_strategies`` (Python) / ``agent.bargeInStrategies`` (TypeScript) tuple lets callers opt into a two-stage confirmation pipeline: VAD speech_start during TTS now marks the barge-in as *pending* (TTS keeps streaming naturally, the in-flight LLM stream is preserved), every STT transcript is fed to each configured strategy, and the first strategy that returns ``True`` cancels the agent and runs the existing flush sequence; if no strategy confirms within ``barge_in_confirm_ms`` (default 1500 ms) the pending state is dropped and the agent finishes its sentence. New module ``getpatter.services.barge_in_strategies`` exposes the ``BargeInStrategy`` Protocol, the ``MinWordsStrategy`` reference implementation (filters short backchannels — "okay", "uh-huh", "yeah" — by requiring N words while the agent is speaking and letting any single word through while the agent is silent), and ``evaluate_strategies`` / ``reset_strategies`` helpers with short-circuit-OR composition and per-strategy error isolation. TS twin in ``src/services/barge-in-strategies.ts``. Wiring lives in ``stream_handler.py`` ``_handle_barge_in`` / ``stream-handler.ts`` ``handleBargeIn`` — both keep the existing canBargeIn gate and only add the confirm step when at least one strategy is configured. Defaults preserved: ``barge_in_strategies=()`` matches the prior cancel-immediately behaviour byte-for-byte, so existing users see no change unless they opt in. New regressions: 14 unit tests for ``MinWordsStrategy`` + composition (Py); 15 parity tests (TS); 10 end-to-end tests covering pending lifecycle, confirmation, timeout, idempotency, and threshold parametrization (Py); 10 TS twins. Files: ``libraries/python/getpatter/services/barge_in_strategies.py``, ``libraries/python/getpatter/models.py``, ``libraries/python/getpatter/__init__.py``, ``libraries/python/getpatter/stream_handler.py``, ``libraries/typescript/src/services/barge-in-strategies.ts``, ``libraries/typescript/src/types.ts``, ``libraries/typescript/src/index.ts``, ``libraries/typescript/src/stream-handler.ts``.
+
+### Fixed
+
+- **Dashboard live-transcript: live pane now accumulates user/assistant lines across every turn** (TypeScript-only, frontend + backend, dashboard BUG 1). The live-transcript fallback in `dashboard-app/src/lib/mappers.ts` derived UI rows from `record.turns[]` (the `TurnMetrics` shape), but the primary mapper path checked `record.transcript.length > 0` — which was always empty for in-flight calls because the active record only carried `turns[]`. On every `turn_complete` SSE the pane re-rendered from a single source of truth that flickered between "fallback derived from one turn" and "primary path with empty transcript", producing the symptom that the most recent user/agent pair would replace the previously-rendered turn instead of appending. Fix: `MetricsStore.recordTurn` now mirrors each completed round-trip into a flat `transcript` array on the active record (one `{role:'user', text, timestamp}` entry when `user_text` is non-empty, one `{role:'assistant', text, timestamp}` entry when `agent_text` is non-empty and not the `[interrupted]` sentinel). The mapper's primary path therefore sees an accumulating `user → assistant → user → assistant → …` history live, identical in shape to what completed calls expose. Files: `libraries/typescript/src/dashboard/store.ts`. New regressions: `libraries/typescript/tests/dashboard-store.test.ts` — `recordTurn appends both user and assistant lines to active.transcript across turns` (3-turn round-trip; asserts 5 entries in the right order) and `recordTurn skips '[interrupted]' agent_text and empty user_text from active.transcript` (filters first-message/interrupted edge cases).
+
+- **Dashboard live-transcript: pane no longer goes blank in the carrier-statusCallback → recordCallEnd race window** (TypeScript-only, frontend + backend, dashboard BUG 2). The Twilio `statusCallback` for `CallStatus=completed` runs `MetricsStore.updateCallStatus(callId, 'completed', …)`, which moved the active record into the completed buffer WITHOUT preserving its running `turns[]` / `transcript[]`. The subsequent WS-driven `recordCallEnd` then overwrote the row in place — but in the race window between those two events the completed entry had no transcript, and any `useTranscript` fetch in that window cleared the live-pane render. Three coupled fixes: (1) `updateCallStatus` now copies `active.turns` and `active.transcript` into the new completed entry on the terminal-status branch; (2) `recordCallEnd` falls back to the running active/existing transcript when `data.transcript` is empty (e.g. `endCall` invoked without an authoritative history payload); (3) the `useTranscript` hook in `dashboard-app/src/hooks/useTranscript.ts` now subscribes to SSE `call_end` events (in addition to `turn_complete`) and refetches the call detail the moment `recordCallEnd` lands the SDK-authoritative `history.entries` transcript. Files: `libraries/typescript/src/dashboard/store.ts`, `dashboard-app/src/hooks/useTranscript.ts`. New regressions: `libraries/typescript/tests/dashboard-store.test.ts` — three new cases covering `updateCallStatus('completed')` carry-over, `recordCallEnd` running-transcript fallback when `data.transcript` is missing, and the explicit `data.transcript` taking precedence over the running fallback.
+
+- **Dashboard sparkline tooltip: per-card metric-specific aggregate (count / avg latency / total cost)** (TypeScript-only, frontend, dashboard BUG 4). Every metric card's hover tooltip showed the same generic "N call(s)" headline and a per-call sample list — so the spend card and the latency card were indistinguishable from the calls card. The tooltip now reports a metric-specific aggregate above the per-call sample list: `TOTAL COST $X.XXX` (sum of per-call cost in the bucket) for the spend card, `AVG LATENCY <p95-mean> ms` (mean of per-call P95 in the bucket) for the latency card, and `N CALLS` for the count cards (existing behaviour, made explicit). Headline label uppercased, monospace, and styled to match the existing time-range header so the tooltip reads consistently with the rest of the site. New `MetricKind` type (`'count' | 'latency' | 'spend'`) drives the headline calculation in pure form via the new `bucketHeadline` export, callable from tests. Files: `dashboard-app/src/components/Metric.tsx`, `dashboard-app/src/App.tsx`, `dashboard-app/src/styles/dashboard.css`.
+
+- **Dashboard: outbound call disappeared from the recent-calls table after end** (Python + TypeScript parity, BUG C, behavioural fix). The Twilio `statusCallback` for `CallStatus=completed` arrives a moment before the WS `stop` frame and runs `update_call_status` / `updateCallStatus`, which already moves the row from `_active_calls` / `activeCalls` into the completed list. Shortly after, the WS-stop path runs `record_call_end` / `recordCallEnd` for the same call_id — but the active record is already gone, so the prior implementations appended a SECOND row with `started_at=0`, empty caller/callee, and freshly captured metrics. `MetricsStore.get_calls` returns newest-first and the dashboard SPA's `mergeCalls` keeps only the first match by call_id, so the older well-formed row was masked by the malformed duplicate; the duplicate's `startedAtMs=0` then dropped it out of the 24h time-range filter and the call vanished from the UI altogether. `record_call_end` / `recordCallEnd` now look up the existing entry in `_calls` / `calls[]` and update it in place (preserving caller/callee/started_at, merging in the just-collected metrics) instead of appending a duplicate. Files: `libraries/python/getpatter/dashboard/store.py`, `libraries/typescript/src/dashboard/store.ts`. New regressions: `libraries/python/tests/unit/test_dashboard_store_unit.py::TestRecordCallEndDeduplication` (2 tests — exercises the full `record_call_initiated → record_call_start → update_call_status → record_call_end` sequence and asserts (a) `call_count == 1` (no duplicate), (b) caller/callee/started_at preserved, (c) the call survives the 24h time-range filter); equivalent 2-test describe in `libraries/typescript/tests/dashboard-store.test.ts`.
+
+- **Dashboard: live transcript pane stayed empty during in-flight calls** (Python + TypeScript parity, BUG A, frontend + backend). Two coupled bugs hid streaming transcripts from the dashboard SPA while a call was in progress: (1) `GET /api/dashboard/calls/:callId` only consulted the completed-call buffer (`store.get_call` / `store.getCall`), returning 404 for any active call; the SPA's `useTranscript` hook polled this route every 2 s and rendered `[]` for the entire call lifetime. (2) The completed-call shape exposes `transcript: TranscriptEntry[]` while active records expose `turns: TurnMetrics[]` (the per-round-trip metrics shape), and `toUiTranscript` in `dashboard-app/src/lib/mappers.ts` only knew how to read `transcript`. Both routes (`/api/dashboard/calls/:callId` and the v1 `/api/v1/calls/:callId`) now fall through to `get_active` / `getActive` when the completed lookup misses, so the live record is reachable. `toUiTranscript` now falls back to `record.turns` when `record.transcript` is empty, deriving user/agent message rows from `user_text` / `agent_text` (skipping the sentinel `[interrupted]` turns). `useTranscript` additionally subscribes to `/api/dashboard/events` for `turn_complete` events filtered by `call_id` so new turns appear within ~50 ms of the round-trip ending — the existing 2 s polling stays in place as a backstop for SSE drops. Files: `libraries/python/getpatter/dashboard/routes.py`, `libraries/typescript/src/dashboard/routes.ts`, `dashboard-app/src/lib/mappers.ts`, `dashboard-app/src/hooks/useTranscript.ts`. New regression: `libraries/python/tests/unit/test_dashboard_store_unit.py::TestActiveCallDetail::test_get_active_returns_record_with_turns` (verifies the accessor the route now falls back to exposes the live turns).
+
+- **Dashboard logs: outbound calls persisted with empty `caller` / `callee` in `metadata.json`** (Python + TypeScript parity, BUG B). Inline TwiML for outbound calls (`<Connect><Stream url="…/ws/stream/outbound"/></Connect>`) carries no `<Parameter>` tags and no query-string metadata, so the WS bridge's `caller` / `callee` are empty strings on outbound. The `_on_call_start` (Py) / `wrapLoggingCallbacks` (TS) wrappers passed those empty strings straight to `CallLogger.log_call_start` / `logCallStart`, and every outbound call's persisted `metadata.json` ended up with `caller=""` / `callee=""` even though the in-memory store had the correct numbers (populated at dial time by `record_call_initiated`). Wrappers now resolve caller/callee from the active store record when the bridge data is empty, so `metadata.json` is faithful to the dial. As a related parity fix: `record_call_start` (Py) was also clobbering existing caller/callee with the empty strings on the upgrade-from-initiated path; it now mirrors the existing TS behaviour and only overwrites when the new value is non-empty. Files: `libraries/python/getpatter/server.py`, `libraries/python/getpatter/dashboard/store.py`, `libraries/typescript/src/server.ts`. New regressions: `libraries/python/tests/unit/test_server_unit.py::TestWrapCallbacks::test_call_log_start_pulls_caller_from_active_record` (real `CallLogger` writes a real `metadata.json`; asserts the masked phone numbers end with the original last-4) and `libraries/typescript/tests/server.test.ts` (parity test in `EmbeddedServer wraps logging callbacks with active-record fallback`).
+
+- **Barge-in: `InterruptionMetrics.detection_delay_ms` corrupted to ~0 on strategy-confirmed cancel** (Python + TypeScript parity, FIX #88, fully backward-compatible). When `agent.barge_in_strategies` was non-empty, the two-stage barge-in flow stamped T1 via `record_overlap_start()` from `_start_pending_barge_in` (VAD speech_start) and then stamped T2 via a SECOND `record_overlap_start()` from `_do_cancel_for_barge_in` after the strategy confirmed — overwriting T1. The downstream `record_overlap_end()` therefore computed `T2 → now ≈ 0`, hiding the real ~150-500 ms VAD-to-confirm latency on every confirmed barge-in. The cancel path now captures the pending state BEFORE clearing it and skips the redundant `record_overlap_start()` when VAD already started the overlap window. Legacy path (`barge_in_strategies=()`, no VAD pending phase) is unchanged — `_do_cancel_for_barge_in` is still the sole caller of `record_overlap_start` there. New regressions in `libraries/python/tests/unit/test_barge_in_two_stage.py::TestBargeInOverlapStartPreserved` (3 tests including end-to-end via real `CallMetricsAccumulator` asserting detection_delay reflects the ~200 ms VAD→confirm window, not ~0) and `libraries/typescript/tests/unit/barge-in-two-stage.test.ts` (`StreamHandler — overlap window preserved across VAD → strategy confirm`, 2 tests). Files: `libraries/python/getpatter/stream_handler.py`, `libraries/typescript/src/stream-handler.ts`.
+
+- **Barge-in: leaked pending-confirmation task on call end** (Python + TypeScript parity, FIX #89, fully backward-compatible). `PipelineStreamHandler.cleanup` (Py) and `StreamHandler.handleStop` / `handleWsClose` (TS) tore down STT / TTS / remote adapters but never dropped the pending barge-in timeout. If a call ended while a barge-in was in pending-timeout state (waiting for strategy confirmation), the asyncio.Task / `setTimeout` remained scheduled and fired `record_overlap_end` / `recordOverlapEnd` on a finalised metrics object `barge_in_confirm_ms` later (default 1500 ms) — a slow leak in long-running servers and a race producing spurious overlap_end events on unrelated subsequent calls if the metrics object got GC'd and reused. Both SDKs now call `_clear_pending_barge_in` / `clearPendingBargeIn` at the top of cleanup, before any other tear-down. Idempotent: safe to call when no pending state exists, so the legacy non-strategy flow is unchanged byte-for-byte. New regressions in `libraries/python/tests/unit/test_barge_in_two_stage.py::TestCleanupClearsPendingBargeIn` (2 tests) and `libraries/typescript/tests/unit/barge-in-two-stage.test.ts` (`StreamHandler — handleStop / handleWsClose drops pending barge-in timer`, 2 tests). Files: `libraries/python/getpatter/stream_handler.py`, `libraries/typescript/src/stream-handler.ts`.
+
+- **Docs drift: `Agent.barge_in_strategies` docstring claimed "TTS is paused"** (Python + TypeScript parity, FIX #90). The docstring on `Agent.barge_in_strategies` (Python) / `agent.bargeInStrategies` (TypeScript) said "the agent's TTS is paused" while a barge-in was pending strategy confirmation, but the implementation does the opposite: TTS continues streaming naturally and only the strategy-confirmed cancel path stops TTS. Replaced with "the agent's TTS continues streaming naturally" so users opting into the confirm pipeline aren't surprised by uninterrupted audio during the pending window. Surgical text-only fix — no behaviour change. Files: `libraries/python/getpatter/models.py`, `libraries/typescript/src/types.ts`.
+
+- **Pipeline first-message prewarm: cached audio sent as a single multi-second buffer (cancel granularity lost)** (Python + TypeScript parity, FIX #97). On a prewarm cache hit, `PipelineStreamHandler.start` (Py) and `StreamHandler.initPipeline` (TS) called `audio_sender.send_audio(prewarm_bytes)` / `bridge.sendAudio(...)` with the full multi-second buffer in one shot, while the live TTS path streams 20-128 ms chunks paced by the upstream provider. A `send_clear` issued mid-buffer therefore had nothing to clear from Twilio's mark/clear bookkeeping, manifesting as "the agent keeps talking after barge-in" on the very first turn only. New private helper `_stream_prewarm_bytes` (Py) / `streamPrewarmBytes` (TS) splits the prewarm buffer into 1280-byte chunks (40 ms PCM16 @ 16 kHz mono — sized to mirror the smallest live-TTS boundary) and forwards each through the existing `audio_sender` / `bridge.sendAudio` so cancel granularity is identical regardless of cache hit vs miss. Same `_is_speaking` guard at every iteration so a barge-in mid-prewarm stops chunking immediately. New regressions: `libraries/python/tests/test_prewarm.py::test_stream_prewarm_bytes_chunks_buffer` + `test_stream_prewarm_bytes_stops_on_barge_in_mid_buffer` (2 tests) and `libraries/typescript/tests/unit/prewarm.test.ts` (`streamPrewarmBytes — chunked send for cancel granularity`, 2 tests). Both assert ≥100 `send_audio`/`bridge.sendAudio` calls for a 5-second buffer (vs 1 in the regression) and that the loop honours mid-prewarm `_is_speaking=False`. Files: `libraries/python/getpatter/stream_handler.py`, `libraries/typescript/src/stream-handler.ts`.
+
+- **OpenAI Realtime warmup: replaced billing-unsafe `response.create` with `session.update`** (Python + TypeScript parity). The earlier prewarm pass sent `{"type": "response.create", "response": {"generate": false}}` to "prime model state", but the `generate` field is NOT in the OpenAI Realtime API schema. Two failure modes were possible: (a) the server silently ignores the unknown field and invokes a real model response, billing tokens on every prewarm, or (b) the request is rejected with `invalid_request_error`, which makes the prewarm a no-op beyond TLS warm. Either way the prior implementation was wrong. The new flow opens the WS, waits for `session.created`, sends a single `session.update` whose body matches what `connect()` sends at production call-pickup (`input_audio_format`, `output_audio_format`, `voice`, `instructions`, `turn_detection`, `input_audio_transcription`, plus any opt-in fields populated on the adapter), waits for the matching `session.updated` ack, then closes cleanly. `session.update` only mutates session configuration — it does not invoke the model, does not consume any audio buffer, and does not trigger token generation, so the warmup is byte-for-byte billing-safe. The `_prewarm_response_id` (Py) / `prewarmResponseId` (TS) field is removed since it was only ever populated by the (broken) `response.create` path. New regression: `tests/unit/test_provider_warmup.py::test_openai_realtime_warmup_does_not_send_response_create` (Py) and the corresponding `does not send response.create on the wire` case in `tests/unit/provider-warmup.mocked.test.ts` (TS) — both fail loudly if a future change reintroduces `response.create` in the warmup path. Files: `libraries/python/getpatter/providers/openai_realtime.py`, `libraries/typescript/src/providers/openai-realtime.ts`.
+
+- **ElevenLabs WS warmup: BOS frame now byte-identical to live `synthesize` BOS** (Python + TypeScript parity). The live `synthesize()` / `synthesizeStream()` path attaches `voice_settings` and (when `auto_mode=False`) `generation_config` to the protocol-required BOS frame, but the warmup variant only sent `{"text": " "}`. Because ElevenLabs may instantiate a different per-session worker depending on the BOS configuration, the warmed worker could end up unrelated to the worker that handles the live request — defeating the edge-warm goal entirely. Both paths now share a single `_build_bos_frame` (Py) / `buildBosFrame()` (TS) helper, so the warmup BOS is byte-identical to the production BOS for any given adapter configuration. New regression: `tests/unit/test_provider_warmup.py::test_elevenlabs_ws_warmup_bos_frame_matches_live_synthesize` (Py) and `warmup BOS bytes are byte-identical to synthesizeStream BOS bytes (regression)` in `tests/unit/provider-warmup.mocked.test.ts` (TS) — both capture the BOS bytes in each path and assert byte-equality. Files: `libraries/python/getpatter/providers/elevenlabs_ws_tts.py`, `libraries/typescript/src/providers/elevenlabs-ws-tts.ts`.
+
+- **Inworld TTS warmup: replaced HEAD against POST-only endpoint with `GET /tts/v1/voices`** (Python + TypeScript parity). The earlier warmup issued `HEAD https://api.inworld.ai/tts/v1/voice:stream`, but that endpoint is POST-only — Inworld returned `405 Method Not Allowed` on every call, completing the TLS handshake but spamming 405s into Inworld's audit logs and into our own logs. The new path issues `GET /tts/v1/voices` (a documented free metadata read that returns the configured voice catalogue) so the response is 2xx-clean. Billing surface is unchanged — the synthesis pipeline is invoked only by `POST /tts/v1/voice:stream` with non-empty `text`. Tests assert the URL targets `/tts/v1/voices` and the response status is 2xx, with explicit asserts that the warmup does NOT target `voice:stream` and does NOT use HEAD. Files: `libraries/python/getpatter/providers/inworld_tts.py`, `libraries/typescript/src/providers/inworld-tts.ts`.
+
+- **Cartesia STT + AssemblyAI STT warmup: API key no longer leaks into logs on handshake failure** (Python + TypeScript parity, security). Both providers authenticate via a query-string parameter on the WS upgrade URL (Cartesia: `?api_key=...`, AssemblyAI optional: `?token=...`). When the WS handshake failed (e.g. 401 from a rotated key), `aiohttp.WSServerHandshakeError.__str__` (Py) and the `ws` library `Error.message` (TS) typically include the full request URL — and `logger.debug("warmup failed: %s", exc)` therefore wrote the API key straight into application logs. The fix catches the handshake-error class specifically before the generic `Exception` handler and logs only the HTTP status code (or, for non-handshake errors, just the exception class name) — never the full message or URL. New regression tests in both SDKs install a custom logger / `caplog` capture, force a 401 handshake error during warmup, and assert (a) the API key never appears in any captured log message, (b) the URL with `?api_key=` / `?token=` never appears either, and (c) the status code is still surfaced so operators see why the warmup failed. Files: `libraries/python/getpatter/providers/{cartesia_stt,assemblyai_stt}.py`, `libraries/typescript/src/providers/{cartesia-stt,assemblyai-stt}.ts`.
+
+- **Dashboard hydrate: hydrated calls no longer lose `cost` and `latency`** (Python + TypeScript parity, fully backward-compatible). `CallLogger.log_call_end` writes `cost`, `latency`, `duration_ms`, and `telephony_provider` as **top-level keys** of `metadata.json`, but `MetricsStore.hydrate` (`libraries/python/getpatter/dashboard/store.py:535`, `libraries/typescript/src/dashboard/store.ts:421-424`) read them only from `meta.metrics.cost` / `meta.metrics.latency`. Result: every call rebuilt from disk landed in the store with `metrics=null`, so the local dashboard rendered `$0.00` and `—` for cost/latency on all hydrated rows; only the in-flight call (which never goes through hydrate) showed real numbers. Caught during 0.6.0 acceptance against `releases/0.6.0/typescript/matrix/outbound-cartesia-cerebras-elevenlabs.ts` — 48 of 49 calls in the dashboard had blank P95/cost columns. Fix promotes the top-level fields into a synthesized `metrics` dict (`metrics_from_top_level` / `metricsFromTopLevel`) when `meta.metrics` is missing, mapping `latency.p95_ms` → `metrics.latency_avg.total_ms` so the existing UI fields populate. Explicit `meta.metrics` (legacy/future shape) is preserved untouched. New regressions: `tests/unit/test_metrics_store_hydrate.py::test_hydrate_lifts_top_level_cost_and_latency_into_metrics` + `test_hydrate_preserves_explicit_metrics_when_present` (Py); two `MetricsStore.hydrate` cases in `tests/dashboard-store.test.ts` (TS). Files: `libraries/python/getpatter/dashboard/store.py`, `libraries/typescript/src/dashboard/store.ts`.
+
+- **Pipeline early barge-in: VAD self-cancellation before TTS first byte arrived** (Python + TypeScript parity, behavioural change for pipeline mode). Cloud TTS providers (ElevenLabs, Cartesia, …) take 200–700 ms to emit the first audio byte. The barge-in anti-flicker gate was anchored on `_speaking_started_at` / `speakingStartedAt` (set inside `_begin_speaking` / `beginSpeaking`), so a 250 ms gate without AEC expired BEFORE TTS produced any audio. VAD then picked up background noise, room ambience, or a "hello?" from the operator and triggered `[VAD] speech_start during TTS → BARGE-IN` → `cancelSpeaking` → `isSpeaking=false` → the `for await (chunk of tts.synthesizeStream(...))` loop exited at `if (!this.isSpeaking) break`, emitting **zero bytes**. From the SDK's perspective the agent "spoke" the first message; from the caller's perspective the line went silent until the next turn. Reproduced on `outbound-cartesia-cerebras-elevenlabs.ts` (call CAfca9c23b22144d4b1bb8ee737dd24016, 47 s — first message never reached the wire). Fix introduces `_first_audio_sent_at` / `firstAudioSentAt`, set in a new `_mark_first_audio_sent` / `markFirstAudioSent` helper invoked AFTER `audio_sender.send_audio` / `bridge.sendAudio` succeeds at all four pipeline emit sites (firstMessage, streaming response, regular response, WebSocket remote). `_can_barge_in` / `canBargeIn` now refuses to open the gate while `_first_audio_sent_at` is null — VAD speech_start before the first wire-time byte is suppressed regardless of how much wall-clock has elapsed since `_begin_speaking`. The 250 ms / 1000 ms gate values are unchanged — only the anchor moves. New regressions: `tests/unit/test_stream_handler_unit.py::test_barge_in_suppressed_before_first_audio_emitted` (Py); `canBargeIn() false before the first TTS chunk has hit the wire` in `tests/unit/stream-handler.test.ts` (TS). Existing `_handle_barge_in` / `handleBargeIn` tests updated to set both timestamps to reflect the new contract. Files: `libraries/python/getpatter/stream_handler.py`, `libraries/typescript/src/stream-handler.ts`.
 
 ## 0.6.0 (2026-05-08)
 
@@ -66,7 +818,7 @@
 
   Defaults unchanged (`gpt-realtime-mini`, `whisper-1`). 7 unit tests Py + 4 unit tests TS covering enum exposure, constructor option storage, `reasoning.effort` wire-format injection (and its absence when unset). Files touched: `libraries/python/getpatter/providers/openai_realtime.py`, `libraries/typescript/src/providers/openai-realtime.ts`, plus the corresponding test files.
 
-- **Speech-edge events for turn-taking instrumentation** (Python + TypeScript parity, additive — no breaking changes). Patter now exposes seven optional async callbacks on every `Patter` instance plus a read-only `conversation_state` (Py) / `conversationState` (TS) snapshot, mirroring the public APIs of LiveKit Agents (`user_state_changed`, `agent_state_changed`, `user_turn_completed`, `user_interruption_detected`), Pipecat (`VADUserStartedSpeakingFrame`, `BotStartedSpeakingFrame`, `LLMFullResponseStartFrame`, `OutputAudioRawFrame`, `InterruptionFrame`) and OpenAI Realtime (`input_audio_buffer.speech_started/_stopped/_committed`). The seven events: `on_user_speech_started` (raw VAD positive edge), `on_user_speech_ended` (raw VAD trailing edge — *not* end-of-utterance), `on_user_speech_eos` (committed EOU — VAD edge + trailing silence + optional semantic turn-detector agreement; the canonical "user finished" signal that anchors `eos_to_first_token_ms`), `on_agent_speech_started` (first wire-time chunk of the agent turn — what the user actually hears, distinct from TTS warmup), `on_agent_speech_ended` (last wire chunk; payload includes `interrupted: bool` for barge-in), `on_llm_token` (TTFT marker, fires once per turn on the first LLM token), `on_audio_out` (first TTS audio chunk per turn — TTS warmup, distinct from wire-time). Each event also records an OpenTelemetry span event on the current call span (`patter.event.user_speech_started`, …, `patter.event.llm_first_token` carrying `gen_ai.request.model` + `gen_ai.provider.name` per the OTel GenAI semconv) when `PATTER_OTEL_ENABLED=1` and the `opentelemetry` peer dep is installed; otherwise the OTel branch is a zero-cost no-op. The dispatcher is callback-safe — observer exceptions are caught and logged, never propagated to the live call. State machine tracks per-side `conversation_state` (`user`: `listening`/`speaking`/`thinking`/`away`, `agent`: `initializing`/`idle`/`listening`/`thinking`/`speaking`) and a monotonically-increasing `turn_idx` that increments on every committed EOU. Wired into the realtime stream handler so `user_speech_started/_ended/_eos` and `agent_speech_started/_ended` fire automatically on the OpenAI Realtime + Twilio/Telnyx path; `on_llm_token` and `on_audio_out` are exposed on the dispatcher for adapter / pipeline-mode integrations to call. New files: `libraries/python/getpatter/_speech_events.py`, `libraries/typescript/src/_speech-events.ts`. Public exports: `SpeechEvents`, `SpeechEventCallback`, `ConversationStateSnapshot`, `UserState`, `AgentState`, `EouTrigger`. 16 unit tests Py + 15 unit tests TS covering every event payload, idempotency (LLM/audio fire-once-per-turn), state transitions, OTel attach contract, callback-exception isolation, chained-callback wrapping, and Patter-level proxy mirroring. Motivated by the `patter-agent-runner` acceptance suite which ships 15 turn-taking assertion verbs (barge-in latency, silence-gap, cross-talk, eos-to-first-token, MOS, WER) that previously auto-skipped because the SDK did not surface per-side speech edges.
+- **Speech-edge events for turn-taking instrumentation** (Python + TypeScript parity, additive — no breaking changes). Patter now exposes seven optional async callbacks on every `Patter` instance plus a read-only `conversation_state` (Py) / `conversationState` (TS) snapshot, covering the standard voice-agent metric set (user/agent state transitions, turn boundaries, TTFT, audio first-byte) and aligning with OpenAI Realtime (`input_audio_buffer.speech_started/_stopped/_committed`) where applicable. The seven events: `on_user_speech_started` (raw VAD positive edge), `on_user_speech_ended` (raw VAD trailing edge — *not* end-of-utterance), `on_user_speech_eos` (committed EOU — VAD edge + trailing silence + optional semantic turn-detector agreement; the canonical "user finished" signal that anchors `eos_to_first_token_ms`), `on_agent_speech_started` (first wire-time chunk of the agent turn — what the user actually hears, distinct from TTS warmup), `on_agent_speech_ended` (last wire chunk; payload includes `interrupted: bool` for barge-in), `on_llm_token` (TTFT marker, fires once per turn on the first LLM token), `on_audio_out` (first TTS audio chunk per turn — TTS warmup, distinct from wire-time). Each event also records an OpenTelemetry span event on the current call span (`patter.event.user_speech_started`, …, `patter.event.llm_first_token` carrying `gen_ai.request.model` + `gen_ai.provider.name` per the OTel GenAI semconv) when `PATTER_OTEL_ENABLED=1` and the `opentelemetry` peer dep is installed; otherwise the OTel branch is a zero-cost no-op. The dispatcher is callback-safe — observer exceptions are caught and logged, never propagated to the live call. State machine tracks per-side `conversation_state` (`user`: `listening`/`speaking`/`thinking`/`away`, `agent`: `initializing`/`idle`/`listening`/`thinking`/`speaking`) and a monotonically-increasing `turn_idx` that increments on every committed EOU. Wired into the realtime stream handler so `user_speech_started/_ended/_eos` and `agent_speech_started/_ended` fire automatically on the OpenAI Realtime + Twilio/Telnyx path; `on_llm_token` and `on_audio_out` are exposed on the dispatcher for adapter / pipeline-mode integrations to call. New files: `libraries/python/getpatter/_speech_events.py`, `libraries/typescript/src/_speech-events.ts`. Public exports: `SpeechEvents`, `SpeechEventCallback`, `ConversationStateSnapshot`, `UserState`, `AgentState`, `EouTrigger`. 16 unit tests Py + 15 unit tests TS covering every event payload, idempotency (LLM/audio fire-once-per-turn), state transitions, OTel attach contract, callback-exception isolation, chained-callback wrapping, and Patter-level proxy mirroring. Motivated by the `patter-agent-runner` acceptance suite which ships 15 turn-taking assertion verbs (barge-in latency, silence-gap, cross-talk, eos-to-first-token, MOS, WER) that previously auto-skipped because the SDK did not surface per-side speech edges.
 
 - **Inworld TTS provider (`inworld-tts-2` + TTS-1.5 family)** (Python + TypeScript parity). New TTS adapter calling Inworld's HTTP NDJSON streaming endpoint `POST https://api.inworld.ai/tts/v1/voice:stream`. Default model is `inworld-tts-2` (sub-200 ms time-to-first-audio, 100+ languages with mid-utterance switching, natural-language voice steering); pass `model: "inworld-tts-1.5-max"` to fall back to the prior generation. Default audio output is `PCM` (PCM_S16LE) at 16 kHz so the result feeds straight into the Patter pipeline without transcoding. Public API: `import { InworldTTS } from "getpatter"` (TS) / `from getpatter import InworldTTS` (Py); pipeline-mode namespace `getpatter/tts/inworld` (TS) / `getpatter.tts.inworld` (Py) with env-var auto-resolve via `INWORLD_API_KEY`. Optional fields: `language` (BCP-47), `temperature` (TTS-1.5 only), `speakingRate` (0.5–1.5), `deliveryMode` (`EXPRESSIVE` / `BALANCED` / `STABLE` — TTS-2 only), `bitrate`. The Inworld dashboard issues a Base64 token already in the form expected by the `Authorization: Basic <token>` header — paste it as `INWORLD_API_KEY` directly. Pricing entry added to `pricing.ts` / `pricing.py` as `inworld` (placeholder $0.020 / 1k chars — verify against current platform tier). Optional dependency: `getpatter[inworld]` adds `aiohttp>=3.10`. New files: `libraries/typescript/src/providers/inworld-tts.ts`, `libraries/typescript/src/tts/inworld.ts`, `libraries/python/getpatter/providers/inworld_tts.py`, `libraries/python/getpatter/tts/inworld.py`. 7 unit tests per SDK covering payload shape, NDJSON parsing, base64 audio decoding, optional-field omission, env-var fallback, and non-200 error surfacing.
 
@@ -221,7 +973,7 @@ Migration: if your code did `from getpatter.handlers.twilio_handler import ...` 
 
 ### Cleanup
 
-- All competitor license headers (LiveKit, Pipecat, Apache, etc.) removed from source files. New rule `.claude/rules/no-competitor-references.md` codifies the policy.
+- All external license headers removed from source files. New rule `.claude/rules/no-competitor-references.md` codifies the policy.
 - Root `LICENSE` updated to `Copyright (c) 2026 Patter Contributors`.
 - `Dockerfile` + `docker-compose.yml` simplified; non-public-repo scripts removed.
 - `playwright.config.ts` + `@playwright/test` devDep dropped (E2E lives in downstream test repo).
@@ -233,10 +985,10 @@ Latency-pass 1: TTFA optimisations grounded in the ElevenLabs latency posts and 
 ### Improved — sentence chunker
 
 - **Italian abbreviations** added to the prefix list (Sig, Sgr, Dott, Prof, Avv, Ing, Geom, Rag, Arch, On, Egr, Spett, Gent, Ill) and the suffix list (ecc, cit, cap, sez, art, pag, fig, tab, cfr, vol, ed). Sentences like _"Ho incontrato il Sig. Rossi alla riunione di stamattina."_ are no longer split on the abbreviation period.
-- **English abbreviations** expanded with the Pipecat NLTK Punkt set: `Gen.`, `Sen.`, `Rep.`, `Lt.`, `Cpt.`, `Capt.`, `Col.`, `Cmdr.`, `Adm.`, `vs.`, `etc.`, `No.`, `Vol.`, `pp.`, `cf.`, `ca.`, `op.`, plus address forms `Mt.`, `Hwy.`, `Rt.`, `Pl.`, `Ave.`, `Blvd.`, `Sq.`. Phrases like _"Compare A vs. B"_ and _"Met Gen. Smith and Sen. Davis"_ no longer split mid-abbreviation.
+- **English abbreviations** expanded with the standard NLTK Punkt abbreviation set: `Gen.`, `Sen.`, `Rep.`, `Lt.`, `Cpt.`, `Capt.`, `Col.`, `Cmdr.`, `Adm.`, `vs.`, `etc.`, `No.`, `Vol.`, `pp.`, `cf.`, `ca.`, `op.`, plus address forms `Mt.`, `Hwy.`, `Rt.`, `Pl.`, `Ave.`, `Blvd.`, `Sq.`. Phrases like _"Compare A vs. B"_ and _"Met Gen. Smith and Sen. Davis"_ no longer split mid-abbreviation.
 - **Suffix + starter pattern preserves the period** (e.g. _"Patter Inc. He left."_ now keeps `Inc.` in the emitted sentence — previously dropped to `Inc`).
-- **All-caps name flush fixed** (Pipecat issue #1692). Previously the gate-5 acronym guard blocked *any* uppercase-preceded period, so _"I was speaking with RAMESH."_ would sit in the buffer forever. Now only purely-uppercase ASCII words ≤3 chars (U, US, USA, NATO patterns) are treated as acronyms.
-- **Multilingual terminator support**. The terminator set now includes ASCII semicolon `;`, Unicode ellipsis `…`, full-width semicolon `；`, full-width period `．`, half-width Japanese period `｡`, plus the Pipecat-derived non-Latin set: Hindi/Devanagari `। ॥`, Arabic `؟ ؛ ۔ ؏`, Armenian `։`, Ethiopic `። ፧`, Khmer `។ ៕`, Burmese `။`, Tibetan `༎ ༏`. Hindi text like _"यह हिन्दी का एक वाक्य है।"_ now flushes correctly.
+- **All-caps name flush fixed**. Previously the gate-5 acronym guard blocked *any* uppercase-preceded period, so _"I was speaking with RAMESH."_ would sit in the buffer forever. Now only purely-uppercase ASCII words ≤3 chars (U, US, USA, NATO patterns) are treated as acronyms.
+- **Multilingual terminator support**. The terminator set now includes ASCII semicolon `;`, Unicode ellipsis `…`, full-width semicolon `；`, full-width period `．`, half-width Japanese period `｡`, plus the non-Latin terminator set: Hindi/Devanagari `। ॥`, Arabic `؟ ؛ ۔ ؏`, Armenian `։`, Ethiopic `። ፧`, Khmer `។ ៕`, Burmese `။`, Tibetan `༎ ༏`. Hindi text like _"यह हिन्दी का एक वाक्य है।"_ now flushes correctly.
 - **Cross-SDK parity fixture** at `tests/parity/scenarios/sentence_chunker.json` — 61 cases covering EN/IT/CJK/Hindi/Arabic punctuation, decimals, abbreviations, currency, dates, ellipsis, JSON, lists, all-caps names. Standalone runner at `tests/parity/sentence_chunker_parity.py` verifies Python and TypeScript emit identical sentence streams (53 / 61 PASS, 8 documented quirks/regressions).
 
 ### Added — opt-in aggressive first-clause flush
@@ -349,7 +1101,7 @@ Cost-accuracy, audio-pipeline, and observability hardening across both SDKs, plu
 ### Deferred to 0.6.0 (tracked)
 - **Per-model OpenAI Realtime pricing map**: default rates are calibrated for `gpt-4o-mini-realtime-preview`. Users on `gpt-realtime` (~3×) or `gpt-4o-realtime-preview` (~10×) still see under-reported cost. Startup warn (from 0.5.5) is the stopgap.
 - **Native `ulaw_8000` negotiation per provider when target is Twilio** — ElevenLabs, LMNT, Cartesia, Rime all accept `ulaw_8000` output format natively. Today we fall through a resample-then-mulaw chain that introduces aliasing. Switching to native negotiation per the ElevenLabs Twilio cookbook is the canonical fix.
-- **Replace 5-tap binomial FIR with Kaiser-windowed half-band (31-tap)** — industry stopband is 60-80 dB; our binomial is ~20 dB. `soxr` (LiveKit default) or `scipy.signal.resample_poly` if available.
+- **Replace 5-tap binomial FIR with Kaiser-windowed half-band (31-tap)** — industry stopband is 60-80 dB; our binomial is ~20 dB. `soxr` or `scipy.signal.resample_poly` if available.
 - **LLM pipeline token tracking** — `anthropic`, `groq`, `cerebras`, `google`, `openai` LLM adapters report latency but never emit token usage. Pipeline-mode `CostBreakdown.llm` is always $0, regardless of actual spend. New `record_llm_usage()` + per-model pricing entries.
 - **TS Telnyx outbound wrong codec** — TS `encodePipelineAudio` and `handleAdapterEvent` ship PCM16 16k to Telnyx that negotiated PCMU 8k. Telnyx customers see broken audio. Requires a `TelephonyBridge.encodeAudio` abstraction parity with Python's `TelnyxAudioSender`.
 - **TS OpenAI Realtime missing `audioFormat` parameter** — Python has it. Blocks TS Telnyx+Realtime.
@@ -377,7 +1129,7 @@ Cost-accuracy, audio-pipeline, and observability hardening across both SDKs, plu
 ### Security
 - **`agent.model` was interpolated into warn logs without sanitisation** — dev-supplied string with ANSI escapes could inject colour codes into log aggregators. Now passes through `sanitizeLogValue`.
 
-### Added — observability (LiveKit/Pipecat-style)
+### Added — observability
 - `CallMetrics.latency_p50` and `.latency_p99` alongside `latency_p95` and `latency_avg`. Lets dashboards show the full distribution (typical UX / SLA / cold-start outlier).
 - `CostBreakdown.llm_cached_savings` as described above.
 - Percentile formula upgraded from `floor(n*p)` (returned max for n<21) to Hyndman-Fan type 7 linear interpolation (same as `numpy.percentile` default). Meaningful on 2-3 sample sets.
@@ -411,7 +1163,7 @@ Users running non-default Realtime models (`gpt-realtime`, `gpt-4o-realtime-prev
 - **p95/p99 returned the sample maximum for any n < 21** — the previous `floor(n * 0.95)` formula was numerically meaningless on short calls. Replaced with linear interpolation between order statistics (Hyndman-Fan type 7, same as `numpy.percentile` default). Both SDKs.
 - **`firstMessage` latency wasn't measured in Python** (TS measured it for pipeline + realtime). Python now emits a turn-level metric for the first greeting in both modes.
 
-### Added — observability (LiveKit/Pipecat-style)
+### Added — observability
 - `CallMetrics` now exposes `latency_p50` and `latency_p99` alongside `latency_p95` and `latency_avg`. Useful to detect cold-start outliers (p99) and typical UX latency (p50). Dashboards can render all four side by side.
 - Both SDKs use the same percentile formula and same filtering (excludes interrupted turns).
 

@@ -406,6 +406,7 @@ describe('StreamHandler', () => {
       return h as unknown as {
         isSpeaking: boolean;
         speakingStartedAt: number | null;
+        firstAudioSentAt: number | null;
         aec: unknown;
         canBargeIn: () => boolean;
         handleBargeIn: (t: { text?: string }) => boolean;
@@ -421,23 +422,39 @@ describe('StreamHandler', () => {
       expect(p.canBargeIn()).toBe(true);
     });
 
+    it('canBargeIn() false before the first TTS chunk has hit the wire', () => {
+      // 0.6.2 fix: ElevenLabs first-byte latency is hundreds of ms. Pre-fix
+      // a 250 ms gate measured from beginSpeaking expired before any audio
+      // went out, letting background noise self-cancel the agent's first
+      // turn. Post-fix the gate is anchored on firstAudioSentAt — if that's
+      // null we are still waiting for the TTS provider's first byte.
+      const h = new StreamHandler(makeDeps(), makeMockWs(), '+15551111111', '+15552222222');
+      const p = priv(h);
+      p.aec = null;
+      p.speakingStartedAt = Date.now() - 5000; // long past the 250 ms gate
+      p.firstAudioSentAt = null; // but no audio has gone out yet
+      expect(p.canBargeIn()).toBe(false);
+    });
+
     // -----------------------------------------------------------------------
-    // AEC OFF (default — PSTN deployments). Gate is 250 ms.
+    // AEC OFF (default — PSTN deployments). Gate is 100 ms.
     // -----------------------------------------------------------------------
     describe('AEC off (PSTN default)', () => {
-      it('canBargeIn() false within 250 ms anti-flicker window', () => {
+      it('canBargeIn() false within 100 ms anti-flicker window', () => {
         const h = new StreamHandler(makeDeps(), makeMockWs(), '+15551111111', '+15552222222');
         const p = priv(h);
         p.aec = null;
-        p.speakingStartedAt = Date.now() - 100;
+        p.speakingStartedAt = Date.now() - 50;
+        p.firstAudioSentAt = Date.now() - 50; // 50 ms — still inside 100 ms gate
         expect(p.canBargeIn()).toBe(false);
       });
 
-      it('canBargeIn() true past 250 ms (well below the 1 s AEC gate)', () => {
+      it('canBargeIn() true past 100 ms (well below the 1 s AEC gate)', () => {
         const h = new StreamHandler(makeDeps(), makeMockWs(), '+15551111111', '+15552222222');
         const p = priv(h);
         p.aec = null;
-        p.speakingStartedAt = Date.now() - 400; // 400 ms — past 250 ms, under 1 s
+        p.speakingStartedAt = Date.now() - 200;
+        p.firstAudioSentAt = Date.now() - 200; // 200 ms — past 100 ms gate, under 1 s
         expect(p.canBargeIn()).toBe(true);
       });
 
@@ -448,6 +465,7 @@ describe('StreamHandler', () => {
         p.aec = null;
         p.isSpeaking = true;
         p.speakingStartedAt = Date.now() - 400;
+        p.firstAudioSentAt = Date.now() - 400;
         const result = p.handleBargeIn({ text: 'stop' });
         expect(result).toBe(true);
         expect(p.isSpeaking).toBe(false);
@@ -467,6 +485,7 @@ describe('StreamHandler', () => {
         const p = priv(h);
         p.aec = aecSentinel;
         p.speakingStartedAt = Date.now() - 400; // would PASS with AEC off
+        p.firstAudioSentAt = Date.now() - 400;
         expect(p.canBargeIn()).toBe(false);
       });
 
@@ -475,6 +494,7 @@ describe('StreamHandler', () => {
         const p = priv(h);
         p.aec = aecSentinel;
         p.speakingStartedAt = Date.now() - 1200;
+        p.firstAudioSentAt = Date.now() - 1200;
         expect(p.canBargeIn()).toBe(true);
       });
 
@@ -484,6 +504,7 @@ describe('StreamHandler', () => {
         p.aec = aecSentinel;
         p.isSpeaking = true;
         p.speakingStartedAt = Date.now() - 400;
+        p.firstAudioSentAt = Date.now() - 400;
         const result = p.handleBargeIn({ text: 'stop' });
         expect(result).toBe(false);
         expect(p.isSpeaking).toBe(true);
@@ -495,10 +516,435 @@ describe('StreamHandler', () => {
         p.aec = aecSentinel;
         p.isSpeaking = true;
         p.speakingStartedAt = Date.now() - 1500;
+        p.firstAudioSentAt = Date.now() - 1500;
         const result = p.handleBargeIn({ text: 'stop' });
         expect(result).toBe(true);
         expect(p.isSpeaking).toBe(false);
       });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // firstMessage mark-gated pacing — BUG #128 regression coverage.
+  //
+  // Pre-fix the firstMessage TTS chunks were pushed into the carrier
+  // WebSocket as fast as the TTS provider yielded them. A barge-in
+  // mid-buffer issued ``sendClear``, but the WebSocket queue between the
+  // SDK and Twilio's edge held several seconds of media frames already,
+  // and the agent kept talking on the user's earpiece until that drained.
+  //
+  // Post-fix every chunk is followed by a mark; the loop awaits the
+  // oldest mark before sending more once ``FIRST_MESSAGE_MARK_WINDOW``
+  // chunks are unconfirmed. ``cancelSpeaking`` drains every pending mark
+  // so the waiting loop exits on the next tick.
+  // -------------------------------------------------------------------------
+  describe('firstMessage mark-gated pacing', () => {
+    interface FmPriv {
+      isSpeaking: boolean;
+      speakingStartedAt: number | null;
+      firstAudioSentAt: number | null;
+      aec: unknown;
+      streamSid: string;
+      pendingMarks: Array<{ name: string; resolve: () => void; promise: Promise<void> }>;
+      firstMessageMarkCounter: number;
+      sendPacedFirstMessageBytes: (b: Buffer) => Promise<boolean>;
+      onMark: (n: string) => Promise<void>;
+      runBargeInCancel: (t: string) => void;
+    }
+
+    function fmPriv(h: StreamHandler): FmPriv {
+      return h as unknown as FmPriv;
+    }
+
+    function primeForFirstMessage(h: StreamHandler): FmPriv {
+      const p = fmPriv(h);
+      p.isSpeaking = true;
+      p.speakingStartedAt = Date.now() - 5000;
+      p.firstAudioSentAt = Date.now() - 5000;
+      p.aec = null;
+      p.streamSid = 'MZtest';
+      return p;
+    }
+
+    async function flushMicrotasks(count = 10): Promise<void> {
+      for (let i = 0; i < count; i++) await Promise.resolve();
+    }
+
+    const CHUNK_BYTES = 1280; // matches StreamHandler.PREWARM_CHUNK_BYTES
+    // 1280 bytes / 32 bytes-per-ms = 40 ms of PCM16 16kHz audio per chunk.
+    const PLAYOUT_MS = CHUNK_BYTES / 32;
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('caps in-flight chunks at FIRST_MESSAGE_MARK_WINDOW and bails on barge-in', async () => {
+      const sendAudio = vi.fn();
+      const sendMark = vi.fn();
+      const sendClear = vi.fn();
+      const bridge = makeMockBridge({ sendAudio, sendMark, sendClear });
+      const h = new StreamHandler(
+        makeDeps({ bridge }),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = primeForFirstMessage(h);
+      // 4 chunks. Window=3, so chunks 1–3 send after their 40ms sleeps and
+      // chunk 4 blocks on waitForMarkWindow until either a mark echoes OR
+      // cancelSpeaking drains the queue.
+      const bytes = Buffer.alloc(CHUNK_BYTES * 4, 0);
+      const sendPromise = p.sendPacedFirstMessageBytes(bytes);
+
+      // Chunks 1–2 go out without sleep (initial burst to pre-fill the PSTN
+      // jitter buffer). Chunk 3 triggers the first fill of the mark window
+      // and its 40ms playout sleep. Advancing by PLAYOUT_MS fires that sleep
+      // and the loop blocks at waitForMarkWindow for chunk 4.
+      await vi.advanceTimersByTimeAsync(PLAYOUT_MS);
+      expect(sendAudio).toHaveBeenCalledTimes(3);
+      expect(sendMark).toHaveBeenCalledTimes(3);
+      expect(p.pendingMarks.length).toBe(3);
+
+      // Simulate a confirmed barge-in: runBargeInCancel calls sendClear +
+      // cancelSpeaking, and cancelSpeaking drains pendingMarks so the
+      // sliding-window wait exits on the next tick.
+      p.runBargeInCancel('the user spoke');
+      await sendPromise;
+
+      expect(sendClear).toHaveBeenCalledTimes(1);
+      expect(p.isSpeaking).toBe(false);
+      // Chunk 4 must NOT have hit the wire.
+      expect(sendAudio).toHaveBeenCalledTimes(3);
+    });
+
+    it('echoed mark slides the window and the next chunk goes out', async () => {
+      const sendAudio = vi.fn();
+      const sendMark = vi.fn();
+      const bridge = makeMockBridge({ sendAudio, sendMark });
+      const h = new StreamHandler(
+        makeDeps({ bridge }),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = primeForFirstMessage(h);
+      const bytes = Buffer.alloc(CHUNK_BYTES * 4, 0);
+      const sendPromise = p.sendPacedFirstMessageBytes(bytes);
+
+      // Chunks 1–2 burst (no sleep). Chunk 3 fills the window → 40ms sleep.
+      await vi.advanceTimersByTimeAsync(PLAYOUT_MS);
+      // Three chunks in flight, one waiting on the window.
+      expect(sendAudio).toHaveBeenCalledTimes(3);
+      expect(sendMark).toHaveBeenCalledTimes(3);
+
+      // Twilio echoes the FIRST chunk's mark — the loop should advance.
+      await p.onMark('fm_1');
+      // Flush microtasks so waitForMarkWindow exits and chunk 4 sends.
+      await flushMicrotasks();
+      // Advance 1 × 40ms for chunk 4's playout sleep.
+      await vi.advanceTimersByTimeAsync(PLAYOUT_MS);
+
+      expect(sendAudio).toHaveBeenCalledTimes(4);
+      expect(sendMark).toHaveBeenCalledTimes(4);
+      // Let the remaining marks "play" so the loop returns.
+      await p.onMark('fm_2');
+      await p.onMark('fm_3');
+      await p.onMark('fm_4');
+      await sendPromise;
+      expect(p.pendingMarks.length).toBe(0);
+    });
+
+    it('Telnyx (no marks): paces via playout-time and bails on cancelSpeaking', async () => {
+      const sendAudio = vi.fn();
+      const sendMark = vi.fn();
+      const sendClear = vi.fn();
+      const bridge = makeMockBridge({
+        telephonyProvider: 'telnyx',
+        sendAudio,
+        sendMark,
+        sendClear,
+      });
+      const h = new StreamHandler(
+        makeDeps({ bridge }),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = primeForFirstMessage(h);
+      // 4 chunks. Each iteration awaits a fake setTimeout (40 ms), so the loop
+      // emits the first chunk and suspends on the fake clock.
+      const bytes = Buffer.alloc(CHUNK_BYTES * 4, 0);
+      const sendPromise = p.sendPacedFirstMessageBytes(bytes);
+
+      // Flush microtasks to let chunk 1 send and hit the fake 40ms timer.
+      await flushMicrotasks();
+      // Telnyx never sends marks — the queue stays empty even mid-loop.
+      expect(sendMark).not.toHaveBeenCalled();
+      expect(p.pendingMarks.length).toBe(0);
+      // At least the first chunk should have hit the wire by the time
+      // we trip the cancel.
+      const sentBeforeCancel = sendAudio.mock.calls.length;
+      expect(sentBeforeCancel).toBeGreaterThanOrEqual(1);
+
+      p.runBargeInCancel('user spoke');
+      // Fire the pending 40ms sleep so the loop can observe isSpeaking=false.
+      await vi.runAllTimersAsync();
+      await sendPromise;
+
+      expect(sendClear).toHaveBeenCalledTimes(1);
+      expect(p.isSpeaking).toBe(false);
+      // After cancel no further chunks may go out.
+      expect(sendAudio).toHaveBeenCalledTimes(sentBeforeCancel);
+    });
+  });
+
+  describe('cleanup drains pending firstMessage marks', () => {
+    interface CleanupPriv {
+      isSpeaking: boolean;
+      speakingStartedAt: number | null;
+      firstAudioSentAt: number | null;
+      aec: unknown;
+      streamSid: string;
+      pendingMarks: Array<{ name: string; resolve: () => void; promise: Promise<void> }>;
+      firstMessageMarkCounter: number;
+      sendMarkAwaitable: () => Promise<void> | null;
+    }
+
+    function priv(h: StreamHandler): CleanupPriv {
+      return h as unknown as CleanupPriv;
+    }
+
+    function primeForFirstMessage(h: StreamHandler): CleanupPriv {
+      const p = priv(h);
+      p.isSpeaking = true;
+      p.speakingStartedAt = Date.now() - 5000;
+      p.firstAudioSentAt = Date.now() - 5000;
+      p.aec = null;
+      p.streamSid = 'MZtest';
+      return p;
+    }
+
+    it('handleStop resolves every pending mark', async () => {
+      const sendMark = vi.fn();
+      const bridge = makeMockBridge({ sendMark });
+      const h = new StreamHandler(
+        makeDeps({ bridge }),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = primeForFirstMessage(h);
+
+      // Queue three marks via the public send path then simulate an
+      // abnormal stop mid firstMessage. Capture each promise so we
+      // can assert they all resolve after handleStop.
+      const m1 = p.sendMarkAwaitable();
+      const m2 = p.sendMarkAwaitable();
+      const m3 = p.sendMarkAwaitable();
+      expect(p.pendingMarks.length).toBe(3);
+
+      await h.handleStop();
+
+      expect(p.pendingMarks.length).toBe(0);
+      // Every captured promise resolved (await would hang otherwise).
+      await Promise.all([m1, m2, m3]);
+    });
+
+    it('handleWsClose resolves every pending mark', async () => {
+      const sendMark = vi.fn();
+      const bridge = makeMockBridge({ sendMark });
+      const h = new StreamHandler(
+        makeDeps({ bridge }),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = primeForFirstMessage(h);
+
+      const m1 = p.sendMarkAwaitable();
+      const m2 = p.sendMarkAwaitable();
+      const m3 = p.sendMarkAwaitable();
+      expect(p.pendingMarks.length).toBe(3);
+
+      await h.handleWsClose();
+
+      expect(p.pendingMarks.length).toBe(0);
+      await Promise.all([m1, m2, m3]);
+    });
+  });
+
+  describe('firstMessage mark counter resets across sends + on cleanup', () => {
+    interface CounterPriv {
+      isSpeaking: boolean;
+      speakingStartedAt: number | null;
+      firstAudioSentAt: number | null;
+      aec: unknown;
+      streamSid: string;
+      pendingMarks: Array<{ name: string; resolve: () => void; promise: Promise<void> }>;
+      firstMessageMarkCounter: number;
+      sendPacedFirstMessageBytes: (b: Buffer) => Promise<boolean>;
+      onMark: (n: string) => Promise<void>;
+    }
+
+    function priv(h: StreamHandler): CounterPriv {
+      return h as unknown as CounterPriv;
+    }
+
+    function primeForFirstMessage(h: StreamHandler): CounterPriv {
+      const p = priv(h);
+      p.isSpeaking = true;
+      p.speakingStartedAt = Date.now() - 5000;
+      p.firstAudioSentAt = Date.now() - 5000;
+      p.aec = null;
+      p.streamSid = 'MZtest';
+      return p;
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('sendPacedFirstMessageBytes resets counter between consecutive sends', async () => {
+      const sendAudio = vi.fn();
+      const sendMark = vi.fn();
+      const bridge = makeMockBridge({ sendAudio, sendMark });
+      const h = new StreamHandler(
+        makeDeps({ bridge }),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = primeForFirstMessage(h);
+
+      // CHUNK_BYTES = 1280 matches StreamHandler.PREWARM_CHUNK_BYTES.
+      // Two chunks stay below FIRST_MESSAGE_MARK_WINDOW (3) so initialFillComplete
+      // never flips to true and neither chunk triggers a playout sleep on Twilio.
+      // advanceTimersByTimeAsync flushes microtasks first so both chunks are sent
+      // synchronously before any time advance occurs.
+      const CHUNK_BYTES = 1280;
+      const PLAYOUT_MS = CHUNK_BYTES / 32; // 40ms (not used on Twilio here, kept for Telnyx parity)
+      const bytes = Buffer.alloc(CHUNK_BYTES * 2, 0);
+
+      const send1 = p.sendPacedFirstMessageBytes(bytes);
+      // Flush microtasks (both chunks go out without sleep) and advance time
+      // to drain any stray timers; marks are still pending — echo them.
+      await vi.advanceTimersByTimeAsync(2 * PLAYOUT_MS);
+      await p.onMark('fm_1');
+      await p.onMark('fm_2');
+      await send1;
+      expect(p.firstMessageMarkCounter).toBe(2);
+      expect(p.pendingMarks.length).toBe(0);
+      const markCallsAfterFirst = sendMark.mock.calls.length;
+      expect(
+        sendMark.mock.calls.slice(0, markCallsAfterFirst).map((c) => c[1] as string),
+      ).toEqual(['fm_1', 'fm_2']);
+
+      // Second send: counter must reset to 0 at the top of the loop,
+      // so the new sequence is fm_1, fm_2 — NOT fm_3, fm_4.
+      const send2 = p.sendPacedFirstMessageBytes(bytes);
+      await vi.advanceTimersByTimeAsync(2 * PLAYOUT_MS);
+      const newMarks = sendMark.mock.calls
+        .slice(markCallsAfterFirst)
+        .map((c) => c[1] as string);
+      expect(newMarks).toEqual(['fm_1', 'fm_2']);
+      expect(p.firstMessageMarkCounter).toBe(2);
+
+      await p.onMark('fm_1');
+      await p.onMark('fm_2');
+      await send2;
+    });
+
+    it('handleStop resets firstMessageMarkCounter', async () => {
+      const h = new StreamHandler(
+        makeDeps(),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = priv(h);
+      // Pretend a prior turn left the counter at 7.
+      p.firstMessageMarkCounter = 7;
+
+      await h.handleStop();
+
+      expect(p.firstMessageMarkCounter).toBe(0);
+    });
+
+    it('handleWsClose resets firstMessageMarkCounter', async () => {
+      const h = new StreamHandler(
+        makeDeps(),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = priv(h);
+      p.firstMessageMarkCounter = 7;
+
+      await h.handleWsClose();
+
+      expect(p.firstMessageMarkCounter).toBe(0);
+    });
+  });
+
+  describe('onMark only updates lastConfirmedMark on a matched mark', () => {
+    interface OnMarkPriv {
+      pendingMarks: Array<{ name: string; resolve: () => void; promise: Promise<void> }>;
+      lastConfirmedMark: string;
+    }
+
+    it('does not overwrite lastConfirmedMark for an unknown mark name', async () => {
+      const h = new StreamHandler(
+        makeDeps(),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = h as unknown as OnMarkPriv;
+
+      // Seed a real matched mark so lastConfirmedMark has a known
+      // baseline that the unmatched echo must not overwrite.
+      let resolveSeed!: () => void;
+      const seedPromise = new Promise<void>((r) => {
+        resolveSeed = r;
+      });
+      p.pendingMarks.push({ name: 'fm_seed', resolve: resolveSeed, promise: seedPromise });
+      await h.onMark('fm_seed');
+      expect(p.lastConfirmedMark).toBe('fm_seed');
+
+      // Emit a mark name that is NOT in pendingMarks — e.g. echo
+      // arrived after drain, or for an unknown identifier. The
+      // handler's lastConfirmedMark must NOT be clobbered.
+      await h.onMark('unknown_xyz');
+      expect(p.lastConfirmedMark).toBe('fm_seed');
+    });
+
+    it('updates lastConfirmedMark only after the queue match succeeds', async () => {
+      const h = new StreamHandler(
+        makeDeps(),
+        makeMockWs(),
+        '+15551111111',
+        '+15552222222',
+      );
+      const p = h as unknown as OnMarkPriv;
+      expect(p.lastConfirmedMark).toBe('');
+
+      let resolveA!: () => void;
+      const promiseA = new Promise<void>((r) => {
+        resolveA = r;
+      });
+      p.pendingMarks.push({ name: 'fm_1', resolve: resolveA, promise: promiseA });
+
+      await h.onMark('fm_1');
+      expect(p.lastConfirmedMark).toBe('fm_1');
+      expect(p.pendingMarks.length).toBe(0);
     });
   });
 });

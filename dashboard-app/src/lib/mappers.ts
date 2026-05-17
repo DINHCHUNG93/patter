@@ -18,6 +18,13 @@ export type CallMode = 'realtime' | 'pipeline' | 'convai' | 'unknown';
 export interface CallCostUi {
   readonly telco?: number;
   readonly llm?: number;
+  readonly stt?: number;
+  readonly tts?: number;
+  /**
+   * @deprecated Sum of stt+tts kept for legacy consumers. New code reads
+   * ``stt`` and ``tts`` separately so the dashboard can label each with the
+   * actual provider (e.g. "Cartesia STT" / "ElevenLabs TTS").
+   */
   readonly sttTts?: number;
   readonly cached?: number;
   readonly total?: number;
@@ -35,12 +42,26 @@ export interface Call {
   readonly duration?: number;
   readonly latencyP95?: number;
   readonly latencyP50?: number;
+  /** avg(llm_ms) across this call's turns — for the waterfall llm bar. */
+  readonly llmAvg?: number;
   readonly sttAvg?: number;
   readonly ttsAvg?: number;
+  /** Number of completed turns. p50/p95 are statistically meaningful only when this is >= 5. */
+  readonly turnCount?: number;
+  /** p50 of agent_response_ms (wait time after user stops speaking). */
+  readonly agentResponseP50?: number;
+  /** p95 of agent_response_ms — user-perceived latency outlier. */
+  readonly agentResponseP95?: number;
   readonly cost: CallCostUi;
   readonly agent?: string;
   readonly model?: string;
   readonly mode?: CallMode;
+  readonly sttProvider?: string;
+  readonly ttsProvider?: string;
+  /** Model identifier within the provider (e.g. "ink-whisper"). */
+  readonly sttModel?: string;
+  readonly ttsModel?: string;
+  readonly llmModel?: string;
   readonly transcriptKey?: string;
   readonly endedAgo?: number;
 }
@@ -122,6 +143,8 @@ function computeCost(record: CallRecord): CallCostUi {
   const result: {
     telco?: number;
     llm?: number;
+    stt?: number;
+    tts?: number;
     sttTts?: number;
     cached?: number;
     total?: number;
@@ -129,9 +152,13 @@ function computeCost(record: CallRecord): CallCostUi {
 
   if (typeof cost.telephony === 'number') result.telco = cost.telephony;
   if (typeof cost.llm === 'number') result.llm = cost.llm;
-
-  if (typeof cost.stt === 'number' || typeof cost.tts === 'number') {
-    result.sttTts = (cost.stt ?? 0) + (cost.tts ?? 0);
+  if (typeof cost.stt === 'number') result.stt = cost.stt;
+  if (typeof cost.tts === 'number') result.tts = cost.tts;
+  if (typeof cost.llm_cached_savings === 'number') {
+    result.cached = cost.llm_cached_savings;
+  }
+  if (result.stt !== undefined || result.tts !== undefined) {
+    result.sttTts = (result.stt ?? 0) + (result.tts ?? 0);
   }
 
   // Only fall back to total when no granular breakdown is available.
@@ -166,7 +193,14 @@ export function toUiCall(record: CallRecord): Call {
   const status = mapStatus(record.status);
   const isLive = status === 'live' || (record.status !== undefined && LIVE_STATUSES.has(record.status));
   const latencyAvg = record.metrics?.latency_avg;
+  const latencyP50 = record.metrics?.latency_p50;
   const latencyP95 = record.metrics?.latency_p95;
+  // Total turn count from runtime metrics (preferred) — falls back to
+  // the persisted transcript length for hydrated rows. Percentile boxes
+  // are hidden in the UI when turnCount < 5 (statistical floor).
+  const turnCount =
+    (Array.isArray(record.metrics?.turns) ? record.metrics?.turns?.length : undefined) ??
+    (Array.isArray(record.transcript) ? record.transcript.length : undefined);
 
   const call: Call = {
     id: record.call_id,
@@ -178,14 +212,29 @@ export function toUiCall(record: CallRecord): Call {
     startedAtMs: typeof record.started_at === 'number' ? record.started_at * 1000 : undefined,
     durationStart: isLive ? record.started_at * 1000 : undefined,
     duration: computeDuration(record, isLive),
-    latencyP95: latencyP95?.total_ms ?? latencyAvg?.total_ms,
-    latencyP50: latencyAvg?.total_ms,
+    // User-perceived "latency" on the dashboard means wait-time AFTER the
+    // caller stops speaking (a.k.a. agent_response_ms / "response latency"
+    // — the metric Pipecat, LiveKit, and OpenAI Realtime all surface).
+    // Falls back to total_ms only for legacy rows that don't carry the
+    // agent_response_ms breakdown — those rows over-state perceived
+    // latency by the user-utterance duration but keep the table populated.
+    latencyP95: latencyP95?.agent_response_ms ?? latencyP95?.total_ms ?? latencyAvg?.total_ms,
+    latencyP50: latencyP50?.agent_response_ms ?? latencyP50?.total_ms ?? latencyAvg?.total_ms,
     sttAvg: latencyAvg?.stt_ms,
     ttsAvg: latencyAvg?.tts_ms,
+    llmAvg: latencyAvg?.llm_ms,
+    turnCount,
+    agentResponseP50: latencyP50?.agent_response_ms,
+    agentResponseP95: latencyP95?.agent_response_ms,
     cost: computeCost(record),
     agent: buildAgentLabel(record),
     model: record.metrics?.llm_provider,
     mode: mapMode(record.metrics?.provider_mode),
+    sttProvider: record.metrics?.stt_provider,
+    ttsProvider: record.metrics?.tts_provider,
+    sttModel: record.metrics?.stt_model,
+    ttsModel: record.metrics?.tts_model,
+    llmModel: record.metrics?.llm_model,
     transcriptKey: record.call_id,
     endedAgo: computeEndedAgo(record),
   };
@@ -194,26 +243,46 @@ export function toUiCall(record: CallRecord): Call {
 
 export function toUiTranscript(record: CallRecord): TranscriptTurn[] {
   const transcript = record.transcript;
-  if (!transcript) return [];
-  const turns: TranscriptTurn[] = [];
-  for (const entry of transcript) {
-    const text = entry.text;
-    switch (entry.role) {
-      case 'user':
-        turns.push({ who: 'user', txt: text });
-        break;
-      case 'assistant':
-        turns.push({ who: 'bot', txt: text });
-        break;
-      case 'tool':
-        turns.push({ who: 'tool', txt: text });
-        break;
-      default:
-        turns.push({ who: 'bot', txt: text });
-        break;
+  if (transcript && transcript.length > 0) {
+    const out: TranscriptTurn[] = [];
+    for (const entry of transcript) {
+      const text = entry.text;
+      switch (entry.role) {
+        case 'user':
+          out.push({ who: 'user', txt: text });
+          break;
+        case 'assistant':
+          out.push({ who: 'bot', txt: text });
+          break;
+        case 'tool':
+          out.push({ who: 'tool', txt: text });
+          break;
+        default:
+          out.push({ who: 'bot', txt: text });
+          break;
+      }
+    }
+    return out;
+  }
+  // Fallback for live calls: completed calls expose ``transcript`` (a flat
+  // array of {role,text}) but in-flight calls expose ``turns`` (the
+  // ``TurnMetrics`` shape — one entry per round-trip with both
+  // ``user_text`` and ``agent_text``). Without this branch the live
+  // transcript pane is empty until the call ends. See dashboard BUG A.
+  const turns = record.turns;
+  if (!turns || turns.length === 0) return [];
+  const out: TranscriptTurn[] = [];
+  for (const raw of turns) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const turn = raw as { user_text?: unknown; agent_text?: unknown };
+    const userText = typeof turn.user_text === 'string' ? turn.user_text : '';
+    const agentText = typeof turn.agent_text === 'string' ? turn.agent_text : '';
+    if (userText.length > 0) out.push({ who: 'user', txt: userText });
+    if (agentText.length > 0 && agentText !== '[interrupted]') {
+      out.push({ who: 'bot', txt: agentText });
     }
   }
-  return turns;
+  return out;
 }
 
 export type SparklineField = 'totalCalls' | 'latency' | 'spend';

@@ -17,7 +17,7 @@ import json
 import logging
 import os
 from enum import StrEnum
-from typing import Any, AsyncIterator
+from typing import ClassVar, Any, AsyncIterator
 
 logger = logging.getLogger("getpatter")
 
@@ -71,6 +71,9 @@ class GoogleLLMProvider:
         temperature: Optional sampling temperature.
         max_output_tokens: Optional output token cap.
     """
+
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "google"
 
     def __init__(
         self,
@@ -130,6 +133,33 @@ class GoogleLLMProvider:
         self._model = model
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
+
+    async def warmup(self) -> None:
+        """Pre-call DNS / TLS warmup for the Gemini API.
+
+        Issues a lightweight ``GET https://generativelanguage.googleapis.com/v1beta/models``
+        so DNS, TLS, and HTTP/2 are already up by the time the first
+        ``generate_content_stream`` call lands. Best-effort: 5 s timeout,
+        all exceptions swallowed at DEBUG. Skipped on Vertex AI which
+        requires Application Default Credentials we don't want to mint
+        for a probe.
+        """
+        try:
+            api_key = getattr(self._client, "_api_client", None)
+            # google-genai's Client doesn't expose the API key once it has
+            # constructed its inner http client; fall back to env var.
+            key = os.environ.get("GOOGLE_API_KEY") or ""
+            if not key:
+                return
+            import httpx
+
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                await http.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": key},
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.debug("Google LLM warmup failed (best-effort): %s", exc)
 
     async def stream(
         self,
@@ -214,10 +244,16 @@ class GoogleLLMProvider:
                     yield {"type": "text", "content": text}
 
         if last_usage is not None:
+            prompt_tokens = getattr(last_usage, "prompt_token_count", 0) or 0
+            completion_tokens = getattr(last_usage, "candidates_token_count", 0) or 0
+            self._record_completion_cost(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
             yield {
                 "type": "usage",
-                "input_tokens": getattr(last_usage, "prompt_token_count", 0) or 0,
-                "output_tokens": getattr(last_usage, "candidates_token_count", 0) or 0,
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
                 "cache_read_tokens": getattr(
                     last_usage, "cached_content_token_count", 0
                 )
@@ -225,6 +261,23 @@ class GoogleLLMProvider:
             }
 
         yield {"type": "done"}
+
+    def _record_completion_cost(
+        self, *, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        """Stamp ``patter.cost.llm_*_tokens`` on the current span."""
+        try:
+            from getpatter.observability.attributes import record_patter_attrs
+
+            record_patter_attrs(
+                {
+                    "patter.cost.llm_input_tokens": prompt_tokens,
+                    "patter.cost.llm_output_tokens": completion_tokens,
+                    "patter.llm.provider": "google",
+                }
+            )
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("_record_completion_cost failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

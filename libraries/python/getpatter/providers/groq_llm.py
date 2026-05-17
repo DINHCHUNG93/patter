@@ -11,12 +11,16 @@ forwarded to ``chat.completions.create`` automatically.
 
 from __future__ import annotations
 
+import logging
 import os
 from enum import StrEnum
+from typing import ClassVar
 
 from getpatter.services.llm_loop import OpenAILLMProvider
 
 __all__ = ["GroqLLMProvider", "GroqModel"]
+
+logger = logging.getLogger("getpatter.providers.groq_llm")
 
 
 class GroqModel(StrEnum):
@@ -54,10 +58,13 @@ class GroqLLMProvider(OpenAILLMProvider):
             :class:`OpenAILLMProvider`.
     """
 
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "groq"
+
     def __init__(
         self,
         api_key: str | None = None,
-        model: Union[GroqModel, str] = _DEFAULT_MODEL,
+        model: GroqModel | str = _DEFAULT_MODEL,
         base_url: str = _GROQ_BASE_URL,
         **kwargs,
     ) -> None:
@@ -85,3 +92,20 @@ class GroqLLMProvider(OpenAILLMProvider):
             base_url=base_url,
             default_headers={"User-Agent": self._user_agent},
         )
+
+    def _record_completion_cost(
+        self, *, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        """Stamp ``patter.cost.llm_*_tokens`` with the Groq provider tag."""
+        try:
+            from getpatter.observability.attributes import record_patter_attrs
+
+            record_patter_attrs(
+                {
+                    "patter.cost.llm_input_tokens": prompt_tokens,
+                    "patter.cost.llm_output_tokens": completion_tokens,
+                    "patter.llm.provider": "groq",
+                }
+            )
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("_record_completion_cost failed", exc_info=True)

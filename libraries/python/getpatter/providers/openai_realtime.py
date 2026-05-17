@@ -160,6 +160,27 @@ class OpenAIRealtimeAdapter:
         # here and drained by ``receive_events`` before reading the socket.
         self._pending_events: deque[str] = deque()
         self._receive_task: asyncio.Task | None = None
+        # Session start time for ``patter.cost.realtime_minutes`` emission on close.
+        import time as _time
+
+        self._session_start_monotonic: float = _time.monotonic()
+
+    def record_session_end(self) -> None:
+        """Emit ``patter.cost.realtime_minutes`` for the elapsed session duration."""
+        try:
+            import time as _time
+
+            from getpatter.observability.attributes import record_patter_attrs
+
+            elapsed = _time.monotonic() - self._session_start_monotonic
+            record_patter_attrs(
+                {
+                    "patter.cost.realtime_minutes": elapsed / 60.0,
+                    "patter.realtime.provider": "openai_realtime",
+                }
+            )
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("record_session_end failed", exc_info=True)
 
     def __repr__(self) -> str:
         return f"OpenAIRealtimeAdapter(model={self.model!r}, voice={self.voice!r}, audio_format={self.audio_format!r})"
@@ -182,6 +203,140 @@ class OpenAIRealtimeAdapter:
         if tool.get("strict") is True:
             wire["strict"] = True
         return wire
+
+    async def warmup(self) -> None:
+        """Pre-call WebSocket warmup for the OpenAI Realtime endpoint.
+
+        The canonical session-only warm step on the Realtime API: open
+        the WS, wait for ``session.created``, send a single
+        ``session.update`` containing the same fields that the production
+        ``connect()`` path applies (``input_audio_format``,
+        ``output_audio_format``, ``voice``, ``instructions``,
+        ``turn_detection``, ``input_audio_transcription``, plus any
+        opt-in fields populated on the adapter), wait for the matching
+        ``session.updated`` ack, then close cleanly. This primes the
+        per-session state on the OpenAI side — DNS + TLS + auth handshake
+        + initial config exchange — without ever invoking the model.
+
+        Earlier revisions sent ``response.create`` with
+        ``{"response": {"generate": false}}`` to prime the inference path.
+        That field is NOT in the OpenAI Realtime API schema; the server
+        either ignores it (and bills tokens for a real model response) or
+        rejects the request with ``invalid_request_error``. Both
+        behaviours are billing-unsafe or a no-op beyond TLS warm. The
+        ``session.update`` flow is documented and side-effect-free.
+
+        Billing safety: ``session.update`` only mutates session
+        configuration. It does NOT invoke the model, does NOT consume
+        any audio buffer, and does NOT trigger token generation, so no
+        per-token cost is accrued. Best-effort: failures are logged at
+        DEBUG and never raised.
+        """
+        url = f"{self.OPENAI_REALTIME_URL}?model={self.model}"
+        ws = None
+        try:
+            ws = await asyncio.wait_for(
+                websockets.connect(
+                    url,
+                    additional_headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "OpenAI-Beta": "realtime=v1",
+                    },
+                    ping_interval=20,
+                    ping_timeout=20,
+                ),
+                timeout=5.0,
+            )
+            # Wait for session.created.
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                data = json.loads(raw)
+                if data.get("type") != "session.created":
+                    # Anything else is unexpected but not fatal — we close.
+                    return
+            except Exception:
+                return
+            # Send session.update with the same fields the production
+            # ``connect()`` path applies, so the upstream session state is
+            # primed identically to a real call.
+            try:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session": self._build_session_config(),
+                        }
+                    )
+                )
+            except Exception:
+                return
+            # Best-effort: drain frames until we see ``session.updated``
+            # (or time out). We don't strictly need the ack to keep the
+            # warmup correct — the TLS + session prime is already done by
+            # the time the server processes our update — but waiting for
+            # it lets us close after a clean handshake instead of mid-frame.
+            deadline = asyncio.get_event_loop().time() + 1.5
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except Exception:
+                    break
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(data, dict) and data.get("type") == "session.updated":
+                    break
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.debug("OpenAI Realtime warmup failed (best-effort): %s", exc)
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+    def _build_session_config(self) -> dict[str, Any]:
+        """Build the session.update body shared by ``connect`` /
+        ``open_parked_connection`` / ``warmup`` so all three paths
+        prime the upstream session identically.
+        """
+        session_config: dict[str, Any] = {
+            "input_audio_format": self.audio_format,
+            "output_audio_format": self.audio_format,
+            "voice": self.voice,
+            "instructions": self.instructions
+            or f"You are a helpful voice assistant. Respond in {self.language}. Be concise and natural.",
+            "turn_detection": {
+                "type": self.vad_type,
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": self.silence_duration_ms,
+            },
+            "input_audio_transcription": {
+                "model": self.input_audio_transcription_model,
+            },
+        }
+        if self.temperature is not None:
+            session_config["temperature"] = self.temperature
+        if self.max_response_output_tokens is not None:
+            session_config["max_response_output_tokens"] = (
+                self.max_response_output_tokens
+            )
+        if self.modalities is not None:
+            session_config["modalities"] = self.modalities
+        if self.tool_choice is not None:
+            session_config["tool_choice"] = self.tool_choice
+        if self.tools:
+            session_config["tools"] = [
+                self._build_tool_wire_format(t) for t in self.tools
+            ]
+        if self.reasoning_effort is not None:
+            session_config["reasoning"] = {"effort": self.reasoning_effort}
+        return session_config
 
     async def connect(self) -> None:
         """Connect to OpenAI Realtime API and wait for ``session.updated`` ack."""
@@ -207,44 +362,11 @@ class OpenAIRealtimeAdapter:
             if data.get("type") != "session.created":
                 raise RuntimeError(f"Expected session.created, got {data.get('type')}")
 
-            # Configure session audio format (g711_ulaw for Twilio, pcm16 for Telnyx)
-            session_config: dict[str, Any] = {
-                "input_audio_format": self.audio_format,
-                "output_audio_format": self.audio_format,
-                "voice": self.voice,
-                "instructions": self.instructions
-                or f"You are a helpful voice assistant. Respond in {self.language}. Be concise and natural.",
-                "turn_detection": {
-                    "type": self.vad_type,
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": self.silence_duration_ms,
-                },
-                "input_audio_transcription": {
-                    "model": self.input_audio_transcription_model,
-                },
-            }
-            if self.temperature is not None:
-                session_config["temperature"] = self.temperature
-            if self.max_response_output_tokens is not None:
-                session_config["max_response_output_tokens"] = (
-                    self.max_response_output_tokens
-                )
-            if self.modalities is not None:
-                session_config["modalities"] = self.modalities
-            if self.tool_choice is not None:
-                session_config["tool_choice"] = self.tool_choice
-            if self.tools:
-                session_config["tools"] = [
-                    self._build_tool_wire_format(t) for t in self.tools
-                ]
-            if self.reasoning_effort is not None:
-                session_config["reasoning"] = {"effort": self.reasoning_effort}
             await self._ws.send(
                 json.dumps(
                     {
                         "type": "session.update",
-                        "session": session_config,
+                        "session": self._build_session_config(),
                     }
                 )
             )
@@ -258,6 +380,87 @@ class OpenAIRealtimeAdapter:
             self._ws = None
             self._running = False
             raise
+
+    async def open_parked_connection(self):  # type: ignore[no-untyped-def]
+        """Open a fresh Realtime WS, exchange ``session.created`` /
+        ``session.update`` / ``session.updated`` so the upstream session
+        is fully primed, and return the OPEN socket WITHOUT taking it
+        on ``self._ws``.
+
+        Used by the prewarm pipeline to park a Realtime connection
+        during ringing; the live consumer adopts it via
+        :meth:`adopt_websocket`.
+
+        Bounded by 8 s. Raises on timeout / handshake failure — the
+        prewarm pipeline treats any error as a cache miss and the call
+        falls through to the cold ``connect()`` path.
+
+        Billing safety: ``session.update`` does not invoke the model.
+        No tokens are billed.
+        """
+        url = f"{self.OPENAI_REALTIME_URL}?model={self.model}"
+        ws = await asyncio.wait_for(
+            websockets.connect(
+                url,
+                additional_headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "OpenAI-Beta": "realtime=v1",
+                },
+                ping_interval=20,
+                ping_timeout=20,
+            ),
+            timeout=8.0,
+        )
+        try:
+            response = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            data = json.loads(response)
+            if data.get("type") != "session.created":
+                raise RuntimeError(f"Expected session.created, got {data.get('type')}")
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": self._build_session_config(),
+                    }
+                )
+            )
+            # Drain frames until session.updated (or 1.5 s timeout).
+            deadline = asyncio.get_event_loop().time() + 1.5
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except Exception:
+                    break
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(data, dict) and data.get("type") == "session.updated":
+                    break
+        except Exception:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            raise
+        return ws
+
+    def adopt_websocket(self, ws) -> None:  # type: ignore[no-untyped-def]
+        """Adopt a pre-opened, already-``session.updated`` Realtime WS
+        produced by the prewarm pipeline. Skips the fresh
+        ``websockets.connect`` + ``session.created`` /
+        ``session.update`` round-trip — saves ~250-450 ms on first turn.
+
+        Caller MUST verify the WS is still alive (``not ws.closed``)
+        before calling and MUST have already received
+        ``session.updated`` on the parked socket. If the parked WS died
+        between park and adopt, fall back to :meth:`connect`.
+        """
+        self._ws = ws
+        self._running = True
 
     async def _await_session_updated(self) -> None:
         """Read a single post-``session.update`` message and return.
@@ -539,6 +742,7 @@ class OpenAIRealtimeAdapter:
 
     async def close(self) -> None:
         """Close the connection and cancel any in-flight receive task."""
+        self.record_session_end()
         self._running = False
         task = self._receive_task
         if task is not None and not task.done():

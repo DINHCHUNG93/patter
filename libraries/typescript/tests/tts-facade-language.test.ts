@@ -9,6 +9,8 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { ElevenLabsRestTTS } from "../src";
+import { ElevenLabsWebSocketTTS } from "../src/providers/elevenlabs-ws-tts";
 import * as elevenlabs from "../src/tts/elevenlabs";
 
 const ENV_KEY = "ELEVENLABS_API_KEY";
@@ -71,5 +73,25 @@ describe("[unit] tts/elevenlabs facade — languageCode forwarding", () => {
   it("throws when no apiKey is available", () => {
     delete process.env[ENV_KEY];
     expect(() => new elevenlabs.TTS()).toThrow(/ELEVENLABS_API_KEY/);
+  });
+
+  it("defaults to the HTTP REST adapter", () => {
+    const tts = new elevenlabs.TTS();
+    // The facade extends ElevenLabsTTS (HTTP REST), not the WebSocket class.
+    expect(tts).not.toBeInstanceOf(ElevenLabsWebSocketTTS);
+    // Static provider key tag for callers / dashboards.
+    expect((elevenlabs.TTS as unknown as { providerKey: string }).providerKey).toBe(
+      "elevenlabs",
+    );
+  });
+
+  it("ElevenLabsRestTTS opt-out is not aliased to the WebSocket class", () => {
+    // Explicit REST opt-out must remain distinct from the WS default.
+    expect(ElevenLabsRestTTS).not.toBe(ElevenLabsWebSocketTTS);
+    const rest = new ElevenLabsRestTTS({ apiKey: "test-key" });
+    expect(rest).not.toBeInstanceOf(ElevenLabsWebSocketTTS);
+    // REST transport drives chunking client-side — historical default kept.
+    const stored = rest as unknown as { chunkSize?: number };
+    expect(stored.chunkSize).toBe(4096);
   });
 });

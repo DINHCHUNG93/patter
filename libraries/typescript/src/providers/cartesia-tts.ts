@@ -29,6 +29,8 @@
  *   default and exists for API symmetry with the Twilio factory.
  */
 
+import { getLogger } from '../logger';
+
 const CARTESIA_BASE_URL = 'https://api.cartesia.ai';
 // Cartesia API version pin — matches our STT integration and the Cartesia
 // Line skill. `2025-04-16` is the current GA snapshot.
@@ -92,6 +94,8 @@ export interface CartesiaTTSOptions {
 
 /** Cartesia TTS provider backed by the HTTP `/tts/bytes` streaming endpoint. */
 export class CartesiaTTS {
+  /** Stable pricing/dashboard key — read by stream-handler/metrics. */
+  static readonly providerKey = 'cartesia_tts';
   private readonly apiKey: string;
   private readonly model: string;
   private readonly voice: string;
@@ -178,6 +182,39 @@ export class CartesiaTTS {
     }
 
     return payload;
+  }
+
+  /**
+   * Pre-call HTTP warmup for the Cartesia `/tts/bytes` endpoint.
+   *
+   * Issues a lightweight `GET <baseUrl>/voices` so DNS, TLS, and HTTP/2
+   * are already up by the time the first `synthesizeStream()` POST
+   * lands. Best-effort: 5 s timeout, all exceptions swallowed at
+   * debug level.
+   *
+   * Billing safety: `GET /voices` is a free metadata read on
+   * Cartesia's REST surface (per https://docs.cartesia.ai). It does
+   * not consume synthesis credits. The actual synthesis is billed
+   * only when `POST /tts/bytes` runs with a non-empty `transcript`.
+   *
+   * Note: Cartesia TTS uses the HTTP path (vs the WebSocket variant
+   * Cartesia also exposes) — connection warmup is therefore HTTP-GET
+   * based, not WebSocket pre-handshake. The latency win is smaller
+   * (~50-150 ms vs the ~200-500 ms of a WS prewarm) but still real.
+   */
+  async warmup(): Promise<void> {
+    try {
+      await fetch(`${this.baseUrl}/voices`, {
+        method: 'GET',
+        headers: {
+          'X-API-Key': this.apiKey,
+          'Cartesia-Version': this.apiVersion,
+        },
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch (err) {
+      getLogger().debug(`Cartesia TTS warmup failed (best-effort): ${String(err)}`);
+    }
   }
 
   /** Synthesize text and return the concatenated audio buffer. */

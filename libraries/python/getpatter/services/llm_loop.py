@@ -338,6 +338,17 @@ class LLMProvider(Protocol):
         """
         ...  # pragma: no cover
 
+    # Optional: ``async def warmup(self) -> None`` — best-effort pre-call
+    # DNS / TLS / HTTP-keepalive warmup invoked by ``Patter.call`` when the
+    # agent has ``prewarm=True``. Concrete providers (OpenAI, Anthropic,
+    # Google, Cerebras, Groq) define this method to issue a lightweight
+    # HTTPS GET to their inference endpoint so by the time the first
+    # ``stream()`` call lands, the connection pool already has a warm
+    # socket. Detected via duck-typed ``getattr(provider, "warmup", None)``
+    # in the client so plain mocks / older providers without ``warmup``
+    # still satisfy this protocol — kept off the Protocol surface to
+    # preserve backward-compat with ``runtime_checkable.isinstance``.
+
 
 # ---------------------------------------------------------------------------
 # Built-in OpenAI provider
@@ -373,6 +384,9 @@ class OpenAILLMProvider:
         user_agent: Optional User-Agent header. Defaults to
             ``f"getpatter/{__version__}"`` for upstream attribution.
     """
+
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "openai"
 
     def __init__(
         self,
@@ -422,6 +436,44 @@ class OpenAILLMProvider:
         self._stop = stop
         self._temperature = temperature
         self._max_tokens = max_tokens
+
+    async def warmup(self) -> None:
+        """Pre-call DNS / TLS / HTTP-keepalive warmup.
+
+        Issues a lightweight ``GET <base_url>/models`` so the underlying
+        ``httpx.AsyncClient`` (owned by the OpenAI SDK) opens a socket and
+        completes the TLS handshake during the carrier ringing window.
+        By the time the first ``chat.completions.create`` call lands, the
+        connection pool has a warm socket and the first chunk arrives a
+        DNS+TLS round-trip earlier (~150-400 ms saved on cold start).
+
+        Note: an HTTPS GET warms DNS + TLS + connection pool but does NOT
+        warm the inference path itself; for true inference warmup a real
+        low-token request is needed, left as a follow-up. STT / TTS providers ship concrete
+        WebSocket-based prewarms (Cartesia / Deepgram / AssemblyAI for
+        STT; ElevenLabs WS for TTS) which save 200-500 ms each — those
+        dominate the cold-start latency budget.
+
+        Best-effort: timeouts and any other exception are swallowed at
+        DEBUG. Mirrors the warmup contract documented on the
+        :class:`LLMProvider` protocol.
+        """
+        try:
+            base_url = str(getattr(self._client, "base_url", "") or "").rstrip("/")
+            if not base_url:
+                return
+            import httpx
+
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                await http.get(
+                    f"{base_url}/models",
+                    headers={
+                        "Authorization": f"Bearer {self._client.api_key}",
+                        "User-Agent": self._user_agent,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.debug("LLM warmup failed (best-effort): %s", exc)
 
     def _build_completion_kwargs(
         self,
@@ -537,12 +589,40 @@ class OpenAILLMProvider:
             # the full input rate (mirrors libraries/typescript/src/llm-loop.ts:296-305).
             prompt_tokens = getattr(last_usage, "prompt_tokens", 0) or 0
             uncached_input = max(0, prompt_tokens - cache_read)
+            completion_tokens = getattr(last_usage, "completion_tokens", 0) or 0
+            self._record_completion_cost(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
             yield {
                 "type": "usage",
                 "input_tokens": uncached_input,
-                "output_tokens": getattr(last_usage, "completion_tokens", 0) or 0,
+                "output_tokens": completion_tokens,
                 "cache_read_tokens": cache_read,
             }
+
+    def _record_completion_cost(
+        self, *, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        """Stamp ``patter.cost.llm_*_tokens`` on the current span.
+
+        Subclasses (Groq, Cerebras) inherit this — the ``patter.llm.provider``
+        tag is overridden in the subclass to identify the upstream vendor.
+        Provider-specific subclasses with a different response shape (Anthropic,
+        Google) override this directly.
+        """
+        try:
+            from getpatter.observability.attributes import record_patter_attrs
+
+            record_patter_attrs(
+                {
+                    "patter.cost.llm_input_tokens": prompt_tokens,
+                    "patter.cost.llm_output_tokens": completion_tokens,
+                    "patter.llm.provider": "openai",
+                }
+            )
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("_record_completion_cost failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +711,12 @@ class LLMLoop:
                 self._provider_name = raw or "custom"
         else:
             self._provider_name = "openai"
+
+        # Diagnostics for the char/4 fallback billing path (see _run_completion).
+        # Counted per-LLMLoop instance (i.e. per call). Surfaced only via logs
+        # — keeps record_llm_usage's public signature unchanged.
+        self._usage_missing_count = 0
+        self._logged_usage_fallback = False
 
         # Build OpenAI-format tool definitions (without handler/webhook_url)
         self._openai_tools: list[dict] | None = None
@@ -727,6 +813,7 @@ class LLMLoop:
             tool_calls_accumulated: dict[int, dict] = {}
             text_parts: list[str] = []
             has_tool_calls = False
+            usage_chunk_received = False
 
             # Open a span around the provider streaming call. Kept as an
             # explicit __enter__/__exit__ (rather than ``with``) because we
@@ -766,6 +853,7 @@ class LLMLoop:
                                 yield content
 
                     elif chunk_type == "usage":
+                        usage_chunk_received = True
                         if self._metrics is not None:
                             self._metrics.record_llm_usage(
                                 provider=self._provider_name,
@@ -807,6 +895,58 @@ class LLMLoop:
                             ]
             finally:
                 _span_cm.__exit__(None, None, None)
+
+            # Fallback billing: some providers (Cerebras streaming has been
+            # observed to do this on certain chunk-shape variants) don't
+            # emit a ``usage`` chunk even with ``stream_options={"include_usage":
+            # True}``. Without this fallback the LLM cost silently shows ~0
+            # for the whole call. char/4 is the canonical OpenAI-tokenizer
+            # rough estimate; conservative-upward is preferable to silent zero.
+            if not usage_chunk_received and self._metrics is not None:
+                input_chars = sum(
+                    len(m.get("content", "") or "")
+                    for m in messages
+                    if isinstance(m, dict)
+                )
+                output_chars = sum(len(p) for p in text_parts)
+                estimated_input = max(1, input_chars // 4)
+                estimated_output = max(1, output_chars // 4)
+                self._metrics.record_llm_usage(
+                    provider=self._provider_name,
+                    model=self._model,
+                    input_tokens=estimated_input,
+                    output_tokens=estimated_output,
+                )
+                self._usage_missing_count += 1
+                # First fallback in this call → INFO so the operator sees it once.
+                # Subsequent iterations only DEBUG to avoid spamming logs on
+                # long tool-loop turns where every iteration is char/4-billed.
+                if not self._logged_usage_fallback:
+                    self._logged_usage_fallback = True
+                    logger.info(
+                        "llm_usage_fallback provider=%s model=%s input_chars=%d "
+                        "output_chars=%d est_input_tokens=%d est_output_tokens=%d",
+                        self._provider_name,
+                        self._model,
+                        input_chars,
+                        output_chars,
+                        estimated_input,
+                        estimated_output,
+                    )
+                else:
+                    logger.debug(
+                        "llm_usage_fallback provider=%s model=%s iteration=%d "
+                        "input_chars=%d output_chars=%d est_input_tokens=%d "
+                        "est_output_tokens=%d total_missing=%d",
+                        self._provider_name,
+                        self._model,
+                        iteration,
+                        input_chars,
+                        output_chars,
+                        estimated_input,
+                        estimated_output,
+                        self._usage_missing_count,
+                    )
 
             # If no tool calls, we're done
             if not has_tool_calls:

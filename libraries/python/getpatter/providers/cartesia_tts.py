@@ -10,9 +10,12 @@ the dependency surface minimal.
 
 from __future__ import annotations
 
+import logging
 import os
 from enum import IntEnum, StrEnum
-from typing import Any, AsyncIterator, Literal, Optional
+from typing import ClassVar, Any, AsyncIterator, Literal, Optional
+
+logger = logging.getLogger("getpatter.providers.cartesia_tts")
 
 from getpatter.providers.base import TTSProvider
 
@@ -113,6 +116,9 @@ class CartesiaTTS(TTSProvider):
       transcoding happens. This is the same as the bare constructor
       default and exists for API symmetry with the Twilio factory.
     """
+
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "cartesia_tts"
 
     def __init__(
         self,
@@ -232,8 +238,23 @@ class CartesiaTTS(TTSProvider):
 
         return payload
 
+    def _record_synthesis_cost(self, text: str) -> None:
+        """Emit ``patter.cost.tts_chars`` for the synthesised text."""
+        try:
+            from getpatter.observability.attributes import record_patter_attrs
+
+            record_patter_attrs(
+                {
+                    "patter.cost.tts_chars": len(text),
+                    "patter.tts.provider": "cartesia_tts",
+                }
+            )
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("_record_synthesis_cost failed", exc_info=True)
+
     async def synthesize(self, text: str) -> AsyncIterator[bytes]:
         """Stream raw PCM_S16LE bytes for ``text`` over HTTP."""
+        self._record_synthesis_cost(text)
         session = self._ensure_session()
 
         headers = {
@@ -252,6 +273,41 @@ class CartesiaTTS(TTSProvider):
             async for chunk in resp.content.iter_chunked(4096):
                 if chunk:
                     yield chunk
+
+    async def warmup(self) -> None:
+        """Pre-call HTTP warmup for the Cartesia ``/tts/bytes`` endpoint.
+
+        Issues a lightweight ``GET <base_url>/voices`` so DNS, TLS, and
+        HTTP/2 are already up by the time the first :meth:`synthesize`
+        POST lands. Best-effort: 5 s timeout, all exceptions swallowed
+        at DEBUG.
+
+        Billing safety: ``GET /voices`` is a free metadata read on
+        Cartesia's REST surface (per https://docs.cartesia.ai). It does
+        not consume any synthesis credits. The actual synthesis is billed
+        only when ``POST /tts/bytes`` runs with a non-empty ``transcript``.
+
+        Note: Cartesia TTS uses the HTTP path (vs the WebSocket variant
+        Cartesia also exposes) — connection warmup is therefore HTTP-GET
+        based, not WebSocket pre-handshake. The latency win is smaller
+        (~50-150 ms vs the ~200-500 ms of a WS prewarm) but still real.
+        """
+        try:
+            session = self._ensure_session()
+            headers = {
+                "X-API-Key": self.api_key,
+                "Cartesia-Version": self.api_version,
+            }
+            async with session.get(
+                f"{self.base_url}/voices",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                # Drain the body so the underlying connection returns to
+                # the pool ready for the next request.
+                await resp.read()
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.debug("Cartesia TTS warmup failed (best-effort): %s", exc)
 
     async def close(self) -> None:
         """Close the underlying session (idempotent)."""

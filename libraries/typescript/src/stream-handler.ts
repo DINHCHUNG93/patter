@@ -166,6 +166,24 @@ export interface StreamHandlerDeps {
   readonly sanitizeVariables: (raw: Record<string, unknown>) => Record<string, string>;
   /** Replace {key} placeholders in a template string. */
   readonly resolveVariables: (template: string, variables: Record<string, string>) => string;
+  /**
+   * Optional accessor returning pre-rendered first-message audio for
+   * ``callId``. Wired by ``Patter.serve()`` when the parent client has
+   * ``agent.prewarmFirstMessage: true``. Returning ``undefined`` means
+   * "no prewarm — always run live TTS".
+   */
+  readonly popPrewarmAudio?: (callId: string) => Buffer | undefined;
+  /**
+   * Optional accessor returning pre-opened, fully-handshaked provider
+   * WebSockets for ``callId`` so the per-call StreamHandler can
+   * adopt them at ``start`` instead of paying the cold handshake on
+   * the first turn. Wired by ``Patter.serve()``. Returning
+   * ``undefined`` (or any sub-field unset) means "no parked socket
+   * for this provider — fall back to fresh ``connect()``".
+   */
+  readonly popPrewarmedConnections?: (
+    callId: string,
+  ) => import('./client').ParkedProviderConnections | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +269,43 @@ export class StreamHandler {
    */
   private speakingStartedAt: number | null = null;
   /**
+   * Wall-clock (ms) when the FIRST TTS audio chunk actually reached the
+   * carrier wire — set in ``markFirstAudioSent`` after ``bridge.sendAudio``
+   * succeeds, cleared by ``beginSpeaking`` / ``cancelSpeaking``. The barge-in
+   * gate measures elapsed from this instant, NOT from ``speakingStartedAt``,
+   * because ElevenLabs (and other cloud TTS) take 200-700 ms to emit the
+   * first byte. A gate anchored to ``beginSpeaking`` would expire on
+   * background noise before any audio went out, exit the TTS loop on
+   * ``isSpeaking=false``, and silently cut the agent's first turn.
+   */
+  private firstAudioSentAt: number | null = null;
+  /**
+   * Optional barge-in confirmation strategies. With an empty array the
+   * SDK falls back to the legacy "cancel on first VAD speech_start"
+   * behaviour. With one or more strategies, a VAD speech_start during
+   * TTS marks the barge-in as *pending* — TTS keeps streaming naturally
+   * — and the strategies are consulted on every STT transcript via
+   * ``handleBargeIn``. The first strategy that returns ``true`` cancels
+   * the agent; if none confirm within ``bargeInConfirmMs`` the pending
+   * state is dropped and the agent finishes its sentence.
+   */
+  private readonly bargeInStrategies: readonly import('./services/barge-in-strategies').BargeInStrategy[];
+  /** Pending-barge-in confirmation timeout in milliseconds. */
+  private readonly bargeInConfirmMs: number;
+  /** Wall-clock (ms) when the current pending barge-in started, or
+   * ``null`` if no barge-in is pending. */
+  private bargeInPendingSince: number | null = null;
+  /** Timer that fires the pending-barge-in timeout. */
+  private bargeInPendingTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Set to true when a VAD ``speech_start`` was suppressed by the
+   * anti-echo gate during the current agent turn.  Cleared on
+   * ``beginSpeaking`` and ``cancelSpeaking``.  When the turn ends
+   * naturally (grace timer), the inbound audio ring is flushed to STT
+   * so the user's speech is not silently discarded.
+   */
+  private suppressedSpeechPending = false;
+  /**
    * Minimum wall-clock duration (ms) the agent must have been speaking
    * before barge-in is allowed to fire when AEC is active. Covers the
    * AEC warmup window (~500 ms) plus a safety margin so residual bleed
@@ -261,10 +316,13 @@ export class StreamHandler {
    * Same as the AEC variant but for deployments where AEC is OFF
    * (default on PSTN — Twilio/Telnyx). Without an adaptive filter to
    * converge, the only justification for a gate is anti-flicker on
-   * micro-events (cough, click). A short 250 ms window keeps real-user
-   * barge-in responsive while still filtering tiny noise spikes.
+   * micro-events (cough, click). 100 ms covers the first PSTN echo
+   * round-trip (~40-100 ms) while allowing barge-in from 100 ms into
+   * the agent's turn — covering nearly all of any response.
+   * Previously 250 ms, which blocked barge-in entirely on short (<500 ms)
+   * agent responses.
    */
-  private static readonly MIN_AGENT_SPEAKING_MS_BEFORE_BARGE_IN_NO_AEC = 250;
+  private static readonly MIN_AGENT_SPEAKING_MS_BEFORE_BARGE_IN_NO_AEC = 100;
   /** Handle for the pending grace-period timer, so it can be cleared on cleanup. */
   private graceTimer: ReturnType<typeof setTimeout> | null = null;
   /**
@@ -286,6 +344,54 @@ export class StreamHandler {
    */
   private lastCancelAt: number | null = null;
   /**
+   * Promise queue tracking outstanding Twilio marks the SDK has sent but
+   * not yet seen echoed back. Used by the firstMessage send loop to bound
+   * the depth of audio queued at the carrier — without this the loop
+   * pushes the entire TTS stream into Twilio's WebSocket in one burst,
+   * and a sendClear issued mid-buffer races against several seconds of
+   * already-queued media frames (BUG #128). The window depth is
+   * ``FIRST_MESSAGE_MARK_WINDOW``; ``onMark`` drains entries as Twilio
+   * confirms playback, ``cancelSpeaking`` resolves every pending entry so
+   * any awaiter exits immediately. Telnyx never populates this queue
+   * (Telnyx's media-stream protocol has no mark concept — the loop
+   * falls back to time-based pacing on that carrier).
+   */
+  private pendingMarks: Array<{
+    name: string;
+    resolve: () => void;
+    promise: Promise<void>;
+  }> = [];
+  /**
+   * Monotonic counter for first-message mark names. Distinct from
+   * ``chunkCount`` (which the Realtime path uses) so the two paths can
+   * coexist without name collisions even when firstMessage finishes while
+   * a Realtime turn is still streaming.
+   */
+  private firstMessageMarkCounter = 0;
+  /**
+   * Maximum unconfirmed Twilio marks while streaming firstMessage. Each
+   * chunk is 40 ms of audio at 16 kHz PCM16, so a window of 3 caps
+   * the in-flight queue at ~120 ms. This means a barge-in's
+   * ``sendClear`` has at most 120 ms of already-buffered audio to flush
+   * — vs. ~2-5 s with the previous burst-send code, which was the
+   * root cause of "firstMessage non interrompibile". Higher values
+   * smooth playback under jittery RTT (each mark echo adds ~150-250 ms
+   * RTT on PSTN) at the cost of longer barge-in latency; lower values
+   * risk under-buffering. 3 hit the smallest barge-in cap without
+   * audible gaps in 2026-05 acceptance.
+   */
+  private static readonly FIRST_MESSAGE_MARK_WINDOW = 3;
+  /**
+   * Per-chunk soft timeout (ms) while awaiting a mark echo. Twilio's
+   * mark echoes typically arrive within 100-250 ms of audio playback.
+   * Capping at 500 ms guards against carriers (or test doubles) that
+   * never echo — without it a stalled echo would deadlock the loop and
+   * the agent would freeze mid-utterance. On timeout we drop the
+   * waiter from the queue and continue: playout may glitch by one
+   * chunk but the call stays alive.
+   */
+  private static readonly MARK_AWAIT_TIMEOUT_MS = 500;
+  /**
    * Minimum drain window (ms) between a ``cancelSpeaking`` and the next
    * ``beginSpeaking``. 150 ms covers a typical PSTN jitter buffer drain
    * + Twilio Media Stream clear propagation. Lower values risk audio
@@ -300,7 +406,7 @@ export class StreamHandler {
    * directly. Awaits the post-cancel drain window before flipping state
    * so the remote player has time to flush the cancelled turn's tail.
    */
-  private async beginSpeaking(): Promise<void> {
+  private async beginSpeaking(isFirstMessage = false): Promise<void> {
     if (this.lastCancelAt !== null) {
       const elapsed = Date.now() - this.lastCancelAt;
       const remaining = StreamHandler.POST_CANCEL_DRAIN_MS - elapsed;
@@ -311,9 +417,48 @@ export class StreamHandler {
     this.speakingGeneration++;
     this.isSpeaking = true;
     this.speakingStartedAt = Date.now();
+    this.suppressedSpeechPending = false;
+    // Stamp ``firstAudioSentAt`` synchronously for EVERY turn so the
+    // ``canBargeIn()`` gate (250ms anti-flicker for PSTN no-AEC) runs in
+    // PARALLEL with LLM TTFT + TTS TTFB rather than starting only after
+    // the first audio chunk reaches the wire. Without this, a turn with
+    // a slow LLM (gpt-4o cold cache ~2 s) is effectively un-interruptible
+    // for the entire LLM window: ``firstAudioSentAt`` stays null, so
+    // ``canBargeIn`` returns false and every VAD ``speech_start`` is
+    // suppressed silently. Previously this fix was firstMessage-only;
+    // promoted to default on 2026-05-11 after the user reported
+    // "barge-in non funziona più" with gpt-4o.
+    //
+    // Note: the ``isFirstMessage`` parameter is kept for backward
+    // compatibility with the call site, but no longer changes behaviour.
+    void isFirstMessage;
+    this.firstAudioSentAt = Date.now();
     // Fresh turn — drop any stale pre-barge-in buffer from a previous turn
     // so we never replay yesterday's audio to STT.
     this.inboundAudioRing = [];
+    // Reset the VAD detector so the next user utterance triggers a clean
+    // SILENCE→SPEECH transition. Without this, PSTN echo from the previous
+    // turn can keep the detector's smoothed probability above the
+    // deactivation threshold (0.35) for the entire turn — the VAD never
+    // returns to SILENCE, ``speech_start`` never fires for the user's next
+    // utterance, and barge-in feels "one-shot" (works once, then never
+    // again). The user's previous utterance was already committed by STT
+    // before ``beginSpeaking`` is called, so resetting state here cannot
+    // lose data.
+    this.resetVad();
+  }
+
+  /**
+   * Record that the first TTS audio chunk of the current turn has hit the
+   * carrier wire. Idempotent within a turn — only the first call sets the
+   * timestamp; later chunks are no-ops. Must be invoked AFTER the underlying
+   * ``bridge.sendAudio`` resolves so the gate is anchored to "audio actually
+   * went out", not "we asked the carrier to send it".
+   */
+  private markFirstAudioSent(): void {
+    if (this.firstAudioSentAt === null) {
+      this.firstAudioSentAt = Date.now();
+    }
   }
 
   /**
@@ -327,7 +472,17 @@ export class StreamHandler {
     this.speakingGeneration++; // invalidates pending grace timers
     this.isSpeaking = false;
     this.speakingStartedAt = null;
+    this.firstAudioSentAt = null;
     this.lastCancelAt = Date.now();
+    this.suppressedSpeechPending = false;
+    // Drain any firstMessage mark waiters so a loop blocked on
+    // ``waitForMarkWindow`` exits on the next tick and observes
+    // ``!isSpeaking``. Without this the loop would stay blocked until
+    // each mark either echoes (carrier still draining its queue) or
+    // hits ``MARK_AWAIT_TIMEOUT_MS`` — keeping the agent "speaking"
+    // from the user's perspective for hundreds of extra ms after
+    // barge-in.
+    this.drainPendingMarks();
     if (this.llmAbort !== null) {
       try {
         this.llmAbort.abort();
@@ -336,6 +491,86 @@ export class StreamHandler {
       }
     }
   }
+
+  /**
+   * Resolve every entry in ``pendingMarks`` and empty the queue. Idempotent
+   * — safe to call from ``cancelSpeaking`` and again from the grace path
+   * without leaking pending promises.
+   */
+  private drainPendingMarks(): void {
+    if (this.pendingMarks.length === 0) return;
+    for (const entry of this.pendingMarks) {
+      try {
+        entry.resolve();
+      } catch {
+        // No-op — pending entries always own a fresh resolve fn.
+      }
+    }
+    this.pendingMarks.length = 0;
+  }
+
+  /**
+   * Push a Twilio ``mark`` event AFTER the corresponding audio chunk and
+   * return a promise that resolves when the mark is echoed back via
+   * ``onMark`` (or when ``cancelSpeaking`` drains the queue, or after
+   * ``MARK_AWAIT_TIMEOUT_MS``). Returns null on non-Twilio carriers — the
+   * caller is expected to fall back to time-based pacing in that case.
+   */
+  private sendMarkAwaitable(): Promise<void> | null {
+    if (this.deps.bridge.telephonyProvider !== 'twilio') return null;
+    this.firstMessageMarkCounter += 1;
+    const markName = `fm_${this.firstMessageMarkCounter}`;
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    this.pendingMarks.push({ name: markName, resolve, promise });
+    try {
+      this.deps.bridge.sendMark(this.ws, markName, this.streamSid);
+    } catch (err) {
+      getLogger().debug(`sendMark failed (${markName}): ${String(err)}`);
+      // Drop the waiter immediately so the queue doesn't fill with
+      // never-resolving entries that block the window.
+      const idx = this.pendingMarks.findIndex((m) => m.name === markName);
+      if (idx >= 0) this.pendingMarks.splice(idx, 1);
+      return Promise.resolve();
+    }
+    return promise;
+  }
+
+  /**
+   * If the in-flight mark queue is at or above ``FIRST_MESSAGE_MARK_WINDOW``
+   * entries, wait for the oldest entry to clear (mark echoed, agent
+   * cancelled, or per-mark timeout). Repeats until the queue depth is
+   * within the window — under high RTT the carrier may have several
+   * marks queued and we want every loop iteration to be naturally back-
+   * pressured by playback.
+   */
+  private async waitForMarkWindow(): Promise<void> {
+    while (
+      this.isSpeaking &&
+      this.pendingMarks.length >= StreamHandler.FIRST_MESSAGE_MARK_WINDOW
+    ) {
+      const oldest = this.pendingMarks[0];
+      const timeout = new Promise<void>((resolve) =>
+        setTimeout(resolve, StreamHandler.MARK_AWAIT_TIMEOUT_MS),
+      );
+      await Promise.race([oldest.promise, timeout]);
+      // Drop the head if it's still the same entry — onMark would
+      // have already removed it on echo; only a timeout leaves it
+      // in place.
+      if (this.pendingMarks[0] === oldest) {
+        this.pendingMarks.shift();
+      }
+    }
+  }
+
+  /**
+   * Bytes-per-millisecond for a 16 kHz PCM16 mono stream. Used by the
+   * non-Twilio firstMessage pacing path to translate chunk size into a
+   * playout-duration sleep. 16000 samples/sec × 2 bytes = 32 bytes/ms.
+   */
+  private static readonly PCM16_16K_BYTES_PER_MS = 32;
 
   /** Cancel and clear the pending grace timer, if any. */
   private clearGraceTimer(): void {
@@ -372,11 +607,62 @@ export class StreamHandler {
         if (this.speakingGeneration === gen) {
           this.isSpeaking = false;
           this.speakingStartedAt = null;
+          this.firstAudioSentAt = null;
+          this.clearPendingBargeIn();
+          void this.resetBargeInStrategies();
+          // If VAD detected speech during the agent's turn but it was
+          // gate-suppressed (agent hadn't been speaking long enough for
+          // barge-in to fire), flush the ring buffer to STT now so the
+          // user's words aren't silently lost.
+          if (this.suppressedSpeechPending) {
+            this.suppressedSpeechPending = false;
+            this.flushInboundAudioRing();
+          }
+          // Reset VAD so any stuck SPEECH state from echo / loopback during
+          // the agent's turn does not block the next user utterance from
+          // emitting ``speech_start``.
+          this.resetVad();
         }
       }, grace);
     } else {
       this.isSpeaking = false;
       this.speakingStartedAt = null;
+      this.firstAudioSentAt = null;
+      this.clearPendingBargeIn();
+      void this.resetBargeInStrategies();
+      if (this.suppressedSpeechPending) {
+        this.suppressedSpeechPending = false;
+        this.flushInboundAudioRing();
+      }
+      this.resetVad();
+    }
+  }
+
+  private async resetBargeInStrategies(): Promise<void> {
+    if (this.bargeInStrategies.length === 0) return;
+    const { resetStrategies } = await import('./services/barge-in-strategies.js');
+    await resetStrategies(this.bargeInStrategies);
+  }
+
+  /**
+   * Reset the active VAD provider's per-utterance state. No-op when the
+   * provider does not implement the optional ``reset()`` hook. Safe to call
+   * from any context — failures are swallowed and the VAD is disabled for
+   * the rest of the call so a flaky reset can never silently kill barge-in
+   * for every subsequent turn.
+   */
+  private resetVad(): void {
+    const activeVad = this.deps.agent.vad ?? this.autoVad;
+    if (!activeVad || this.vadDisabled) return;
+    try {
+      const ret = activeVad.reset?.();
+      if (ret instanceof Promise) {
+        ret.catch((err) => {
+          getLogger().debug(`VAD reset threw: ${String(err)}`);
+        });
+      }
+    } catch (err) {
+      getLogger().debug(`VAD reset threw: ${String(err)}`);
     }
   }
 
@@ -387,7 +673,14 @@ export class StreamHandler {
    */
   private canBargeIn(): boolean {
     if (this.speakingStartedAt === null) return true;
-    const elapsed = Date.now() - this.speakingStartedAt;
+    // Anchor the gate on "first audio actually emitted", not on
+    // ``beginSpeaking`` (which fires before the TTS provider's first-byte
+    // latency has elapsed). Without this guard, background noise picked up
+    // by VAD ~250 ms after ``beginSpeaking`` triggers a self-cancel BEFORE
+    // any TTS chunk has reached the wire — the agent's first turn becomes
+    // silence even though the SDK believes it spoke.
+    if (this.firstAudioSentAt === null) return false;
+    const elapsed = Date.now() - this.firstAudioSentAt;
     const gate = this.aec
       ? StreamHandler.MIN_AGENT_SPEAKING_MS_BEFORE_BARGE_IN_AEC
       : StreamHandler.MIN_AGENT_SPEAKING_MS_BEFORE_BARGE_IN_NO_AEC;
@@ -498,6 +791,13 @@ export class StreamHandler {
     this.ws = ws;
     this.caller = caller;
     this.callee = callee;
+
+    this.bargeInStrategies = (deps.agent.bargeInStrategies ?? []).slice();
+    const confirmMs = deps.agent.bargeInConfirmMs;
+    this.bargeInConfirmMs =
+      typeof confirmMs === 'number' && Number.isFinite(confirmMs) && confirmMs > 0
+        ? confirmMs
+        : 1500;
 
     this.history = createHistoryManager(200);
 
@@ -862,15 +1162,35 @@ export class StreamHandler {
             );
           }
           if (evt?.type === 'speech_start') {
-            if (this.isSpeaking && !this.canBargeIn()) {
+            const phantomSuppressed = this.isSpeaking && !this.canBargeIn();
+            if (phantomSuppressed) {
               // Within the per-turn warmup gate. With AEC on this is the
               // ~1 s filter convergence window; without AEC it is just a
-              // 250 ms anti-flicker margin. INFO so unexpected
+              // 100 ms anti-flicker margin. INFO so unexpected
               // suppressions are visible without enabling debug logs.
+              //
+              // CRITICAL: do NOT touch metrics state here. An earlier
+              // bug (pre-0.6.1) called ``startTurnIfIdle()`` for every
+              // ``speech_start`` including suppressed phantoms, which
+              // stamped ``turnStart`` at echo/loopback time. The
+              // legitimate user-speech ``speech_start`` that followed
+              // then no-op'd (turn_start was already set), so the
+              // dashboard reported ``user_speech_duration_ms`` of 5-7 s
+              // even on short ~1 s utterances.
               getLogger().info(
                 `[VAD] speech_start suppressed (agent speaking < gate, aec=${this.aec ? 'on' : 'off'})`,
               );
+              // Mark that real user speech was detected but gated out.
+              // The grace-timer callback will replay the ring buffer to
+              // STT so the speech isn't silently discarded when the
+              // agent finishes naturally without a barge-in.
+              this.suppressedSpeechPending = true;
             } else if (this.isSpeaking) {
+              if (this.bargeInStrategies.length > 0) {
+                this.startPendingBargeIn();
+                this.metricsAcc.anchorUserSpeechStart();
+                return;
+              }
               getLogger().info('[VAD] speech_start during TTS → BARGE-IN');
               this.metricsAcc.recordOverlapStart();
               this.metricsAcc.recordBargeinDetected();
@@ -902,7 +1222,13 @@ export class StreamHandler {
                 }
               }
             }
-            this.metricsAcc.startTurnIfIdle();
+            if (!phantomSuppressed) {
+              // Industry-standard pattern: every legitimate VAD speech_start re-anchors
+              // the turn timestamp pre-commit. Repairs stale anchors from
+              // rejected barge-ins / dropped final transcripts, plus the
+              // original phantom-during-warmup-gate vulnerability.
+              this.metricsAcc.anchorUserSpeechStart();
+            }
           } else if (evt?.type === 'speech_end') {
             this.metricsAcc.recordVadStop();
             // The SDK's VAD has detected end-of-speech earlier and more
@@ -1022,14 +1348,57 @@ export class StreamHandler {
    */
   /** Handle a Twilio Media Streams `mark` event acknowledging audio playback boundaries. */
   async onMark(markName: string): Promise<void> {
-    if (markName) {
-      this.lastConfirmedMark = markName;
+    if (!markName) return;
+    // Resolve the firstMessage mark waiter (if any) so the send loop
+    // can advance its sliding window. We resolve the matched entry AND
+    // every entry before it in the queue — Twilio sometimes batches
+    // mark echoes, and dropping earlier entries first keeps FIFO order
+    // even when the higher-numbered echo arrives before a lower-
+    // numbered one (rare but observed on degraded edges).
+    const idx = this.pendingMarks.findIndex((m) => m.name === markName);
+    if (idx < 0) return;
+    // Only record the echo after we have confirmed it matches a known
+    // queued mark. Before this gate ``onMark`` clobbered
+    // ``lastConfirmedMark`` with any mark name — including stale
+    // echoes that no longer correspond to anything we sent, or marks
+    // emitted by adapters outside the firstMessage queue — which
+    // would contaminate any downstream barge-in heuristic gated on
+    // ``lastConfirmedMark``. The Python parity here is structural:
+    // ``stream_handler.py``'s ``on_mark`` never touches a handler-
+    // level field at all (the equivalent state lives on
+    // ``TwilioAudioSender.last_confirmed_mark``, updated only via
+    // the carrier's own echo handler).
+    this.lastConfirmedMark = markName;
+    const resolved = this.pendingMarks.splice(0, idx + 1);
+    for (const entry of resolved) {
+      try {
+        entry.resolve();
+      } catch {
+        // No-op.
+      }
     }
   }
 
   /** Handle call stop / stream end. */
   /** Handle a carrier-emitted `stop` event signalling the call has ended. */
   async handleStop(): Promise<void> {
+    // Drop any pending barge-in timer BEFORE we tear down metrics /
+    // adapters. Without this, a call that ends while a barge-in is
+    // pending leaves a setTimeout scheduled to fire ``bargeInConfirmMs``
+    // later and call ``metricsAcc.recordOverlapEnd`` on a finalised
+    // metrics object — a slow leak in long-running servers and a race
+    // producing spurious overlap_end events. Idempotent.
+    this.clearPendingBargeIn();
+    // Resolve every pending firstMessage mark waiter before tearing the
+    // adapter down. A call that ends mid firstMessage (carrier stop
+    // arriving before the paced sender finished) would otherwise leak
+    // unresolved promises owned by the send loop.
+    this.drainPendingMarks();
+    // Reset the firstMessage mark counter so a re-used handler starts
+    // ``fm_<n>`` numbering at 1 on the next call. See
+    // ``sendPacedFirstMessageBytes`` for the per-send reset that
+    // protects the within-call path.
+    this.firstMessageMarkCounter = 0;
     this.clearGraceTimer();
     this.flushResamplers();
     await this.closeSttOnce();
@@ -1040,6 +1409,14 @@ export class StreamHandler {
   /** Handle WebSocket close event. */
   /** Tear down adapter, STT/TTS, and per-call state when the carrier WebSocket closes. */
   async handleWsClose(): Promise<void> {
+    // See handleStop — drop pending barge-in timer before cleanup so a
+    // dead handler can never fire a stale recordOverlapEnd callback.
+    this.clearPendingBargeIn();
+    // See handleStop — drain pending firstMessage marks so an abnormal
+    // carrier WS drop during the paced sender cannot leak unresolved
+    // promises owned by the send loop, and reset the counter.
+    this.drainPendingMarks();
+    this.firstMessageMarkCounter = 0;
     this.clearGraceTimer();
     this.flushResamplers();
     // Drain STT first so in-flight transcripts fire before onCallEnd.
@@ -1094,6 +1471,96 @@ export class StreamHandler {
     this.ttsByteCarry =
       alignedLen < combined.length ? combined.subarray(alignedLen) : null;
     return combined.subarray(0, alignedLen);
+  }
+
+  /**
+   * 40 ms @ 16 kHz mono PCM16 = 1280 bytes. Sized to mirror the smallest
+   * live-TTS chunk boundary so cancel granularity (mark/clear bookkeeping)
+   * is identical regardless of whether the firstMessage came from the
+   * prewarm cache or a live ``tts.synthesizeStream`` stream.
+   */
+  private static readonly PREWARM_CHUNK_BYTES = 1280;
+
+  /**
+   * Stream a cached firstMessage buffer in pacing-friendly chunks.
+   *
+   * Splits ``prewarmBytes`` into ``PREWARM_CHUNK_BYTES`` slices and
+   * forwards each through ``deps.bridge.sendAudio`` exactly like the
+   * live TTS path does — preserving Twilio mark/clear granularity. A
+   * single multi-second sendAudio call would push the whole intro into
+   * the carrier in one go and a ``sendClear`` issued mid-buffer would
+   * have nothing to clear ("agent keeps talking after barge-in" UX bug
+   * on the very first turn).
+   *
+   * Returns ``true`` when at least one chunk hit the wire — the caller
+   * uses that to decide whether to record TTS-first-byte / turn-complete
+   * metrics.
+   */
+  private async streamPrewarmBytes(prewarmBytes: Buffer): Promise<boolean> {
+    return this.sendPacedFirstMessageBytes(prewarmBytes);
+  }
+
+  /**
+   * Iterate ``bytes`` as ``PREWARM_CHUNK_BYTES``-sized PCM16 slices and
+   * forward each via ``deps.bridge.sendAudio`` with mark-gated pacing
+   * (Twilio) or playout-time-based pacing (Telnyx). Caps the carrier-
+   * side buffer at ``FIRST_MESSAGE_MARK_WINDOW`` chunks so a barge-in's
+   * ``sendClear`` has ~120 ms (Twilio) or zero (Telnyx, immediately
+   * after the latest sleep) of audio to flush.
+   *
+   * Bails immediately when ``isSpeaking`` flips to false — both via the
+   * loop's pre-iter check and via ``drainPendingMarks`` (called from
+   * ``cancelSpeaking``) which unblocks any in-flight ``waitForMarkWindow``.
+   *
+   * Returns ``true`` when at least one chunk hit the wire — the caller
+   * uses that to decide whether to record TTS-first-byte / turn-complete
+   * metrics. See BUG #128 for the regression this fix targets.
+   */
+  private async sendPacedFirstMessageBytes(bytes: Buffer): Promise<boolean> {
+    // Reset the per-send mark counter so each invocation produces a
+    // fresh ``fm_1, fm_2, ...`` sequence. Without this the counter
+    // grows monotonically across turns on a re-used handler and a
+    // stale ``fm_N`` echo from an earlier turn could match a mark
+    // name issued later, corrupting the FIFO matching in ``onMark``.
+    // The queue is also expected empty here by ``cancelSpeaking`` /
+    // ``handleStop`` / ``handleWsClose``; drain defensively if not.
+    if (this.pendingMarks.length > 0) this.drainPendingMarks();
+    this.firstMessageMarkCounter = 0;
+    let firstChunkSent = false;
+    // Once the mark window is first filled we switch to playout-time pacing
+    // to prevent batch-ACK bursts. Before that we send in burst so the first
+    // FIRST_MESSAGE_MARK_WINDOW chunks pre-fill the PSTN jitter buffer.
+    let initialFillComplete = false;
+    for (let i = 0; i < bytes.length; i += StreamHandler.PREWARM_CHUNK_BYTES) {
+      if (!this.isSpeaking) break; // barge-in mid-buffer — stop now
+      // Back-pressure: if too many marks are unconfirmed, wait. Drains
+      // immediately on cancelSpeaking.
+      await this.waitForMarkWindow();
+      if (!this.isSpeaking) break;
+      const chunk = bytes.subarray(i, i + StreamHandler.PREWARM_CHUNK_BYTES);
+      if (!firstChunkSent) firstChunkSent = true;
+      if (this.aec) this.aec.pushFarEnd(chunk);
+      const encoded = this.encodePipelineAudio(chunk);
+      this.deps.bridge.sendAudio(this.ws, encoded, this.streamSid);
+      this.markFirstAudioSent();
+      const markPromise = this.sendMarkAwaitable();
+      if (!initialFillComplete && this.pendingMarks.length >= StreamHandler.FIRST_MESSAGE_MARK_WINDOW) {
+        initialFillComplete = true;
+      }
+      // Telnyx has no mark concept — always pace by playout time.
+      // Twilio: the first FIRST_MESSAGE_MARK_WINDOW chunks go out in burst
+      // to pre-fill the PSTN jitter buffer (250–1500 ms), then playout-time
+      // pacing kicks in (via the sticky initialFillComplete flag) to prevent
+      // batch-ACK bursts from draining the buffer → crackling.
+      if (markPromise === null || initialFillComplete) {
+        const playoutMs = Math.max(
+          1,
+          Math.floor(chunk.length / StreamHandler.PCM16_16K_BYTES_PER_MS),
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, playoutMs));
+      }
+    }
+    return firstChunkSent;
   }
 
   // ---------------------------------------------------------------------------
@@ -1162,8 +1629,8 @@ export class StreamHandler {
 
     // Acoustic echo cancellation: opt-in.
     //
-    // Per the industry consensus (LiveKit, Pipecat, Vapi, Retell, Bland)
-    // and Twilio's own guidance, time-domain NLMS server-side AEC is the
+    // Per the industry consensus on PSTN echo cancellation and Twilio's
+    // own guidance, time-domain NLMS server-side AEC is the
     // RIGHT tool only when the SDK has near-direct access to the mic and
     // speaker (browser WebRTC, mobile native). PSTN paths route through
     // a 250–1500 ms Twilio jitter buffer + carrier loop — far outside
@@ -1201,14 +1668,81 @@ export class StreamHandler {
       }
     }
 
-    try {
-      if (this.stt) await this.stt.connect();
-      getLogger().debug(`Pipeline mode (${label}): STT + TTS connected`);
-    } catch (e) {
-      getLogger().error(`Pipeline connect FAILED (${label}):`, e);
-      try { await this.deps.bridge.endCall(this.callId, this.ws); } catch { /* best effort */ }
-      return;
+    // Prewarm-handoff: try to adopt pre-opened provider WebSockets that
+    // the prewarm pipeline (see ``Patter.parkProviderConnections``)
+    // parked during the carrier ringing window. When a parked WS is
+    // still OPEN we skip the cold ``connect()`` and the STT first-turn
+    // can flow audio without paying the 150-400 ms TLS handshake.
+    // Failures (cache miss, parked WS died) fall back transparently.
+    let parked: import('./client').ParkedProviderConnections | undefined;
+    if (this.deps.popPrewarmedConnections) {
+      try {
+        parked = this.deps.popPrewarmedConnections(this.callId);
+      } catch (err) {
+        getLogger().debug(`popPrewarmedConnections raised: ${String(err)}`);
+      }
     }
+    // Adopt the TTS WS first — it's a synchronous handoff (the live
+    // ``synthesizeStream`` call below picks it up via the adapter's
+    // single-slot adoption queue).
+    const parkedTts = parked?.tts;
+    if (parkedTts && this.tts) {
+      const ttsAny = this.tts as { adoptWebSocket?: (p: typeof parkedTts) => void };
+      if (typeof ttsAny.adoptWebSocket === 'function' && parkedTts.ws.readyState === 1 /* OPEN */) {
+        try {
+          ttsAny.adoptWebSocket(parkedTts);
+          getLogger().info(`[CONNECT] callId=${this.callId} provider=tts source=adopted ms=0`);
+        } catch (err) {
+          getLogger().debug(`TTS adoptWebSocket failed: ${String(err)}; falling back`);
+          try { parkedTts.ws.close(); } catch { /* ignore */ }
+        }
+      } else {
+        try { parkedTts.ws.close(); } catch { /* ignore */ }
+      }
+    }
+
+    // Kick off STT connect WITHOUT awaiting yet — we only need STT ready
+    // to receive incoming user audio, not to send the first agent
+    // message out. Parallelising STT.connect with the TTS firstMessage
+    // synth shaves 200-400 ms off the perceived first-turn latency.
+    let sttConnectPromise: Promise<void> | null = null;
+    if (this.stt) {
+      const sttAny = this.stt as { adoptWebSocket?: (ws: import('ws').WebSocket) => void };
+      const sttStarted = Date.now();
+      if (
+        parked?.stt &&
+        typeof sttAny.adoptWebSocket === 'function' &&
+        parked.stt.readyState === 1 /* OPEN */
+      ) {
+        try {
+          sttAny.adoptWebSocket(parked.stt);
+          getLogger().info(
+            `[CONNECT] callId=${this.callId} provider=stt source=adopted ms=${Date.now() - sttStarted}`,
+          );
+          sttConnectPromise = Promise.resolve();
+        } catch (err) {
+          getLogger().debug(`STT adoptWebSocket failed: ${String(err)}; falling back`);
+          try { parked.stt.close(); } catch { /* ignore */ }
+          sttConnectPromise = (async () => {
+            await this.stt!.connect();
+            getLogger().info(
+              `[CONNECT] callId=${this.callId} provider=stt source=fresh ms=${Date.now() - sttStarted}`,
+            );
+          })();
+        }
+      } else {
+        if (parked?.stt) {
+          try { parked.stt.close(); } catch { /* ignore */ }
+        }
+        sttConnectPromise = (async () => {
+          await this.stt!.connect();
+          getLogger().info(
+            `[CONNECT] callId=${this.callId} provider=stt source=fresh ms=${Date.now() - sttStarted}`,
+          );
+        })();
+      }
+    }
+    getLogger().debug(`Pipeline mode (${label}): STT connect kicked off`);
 
     if (this.deps.agent.firstMessage && !this.deps.onMessage && this.tts) {
       this.metricsAcc.startTurn();
@@ -1218,24 +1752,55 @@ export class StreamHandler {
       // and produces garbage transcripts, and the ring buffer for
       // pre-barge-in audio is never populated. Mirrors the per-turn
       // behaviour in `runPipelineLlm` / `runRegularLlm`.
-      await this.beginSpeaking();
+      // Pass isFirstMessage=true so the canBargeIn() anti-flicker gate
+      // starts running NOW — TTFB on the TTS provider often eats 300-800ms,
+      // and without an early anchor the firstMessage is uninterruptible
+      // during that window.
+      await this.beginSpeaking(true);
       let firstChunkSent = false;
       this.resetTtsCarry();
+      // Check the prewarm cache first. When ``Patter.call`` was made
+      // with ``agent.prewarmFirstMessage: true`` the firstMessage has
+      // already been synthesised during the ringing window — we send
+      // the bytes directly through the carrier-side encoder (which
+      // handles native-rate → carrier-rate resampling) and skip the
+      // TTS round-trip entirely.
+      let prewarmBytes: Buffer | undefined;
+      if (this.deps.popPrewarmAudio) {
+        try {
+          prewarmBytes = this.deps.popPrewarmAudio(this.callId);
+        } catch (err) {
+          getLogger().debug(`popPrewarmAudio raised: ${String(err)}`);
+        }
+      }
       try {
-        for await (const chunk of this.tts.synthesizeStream(this.deps.agent.firstMessage)) {
-          if (!this.isSpeaking) break;  // barge-in or test-hangup
-          if (!firstChunkSent) { firstChunkSent = true; this.metricsAcc.recordTtsFirstByte(); await this.emitAudioOut(); }
-          // Far-end tap for the echo canceller — push the exact PCM the
-          // carrier-side encoder will transmit. Without this the AEC
-          // adapt loop has no reference signal during the intro,
-          // resulting in unmitigated bleed-through and a "first turn
-          // unresponsive" UX where the user's voice is masked by the
-          // agent's TTS in the inbound channel.
-          if (this.aec) {
-            this.aec.pushFarEnd(chunk);
+        if (prewarmBytes) {
+          this.metricsAcc.recordTtsFirstByte();
+          await this.emitAudioOut();
+          firstChunkSent = await this.streamPrewarmBytes(prewarmBytes);
+        } else {
+          // Streaming TTS path (no prewarm cache). Uses the same simple
+          // per-chunk send as synthesizeSentence — ElevenLabs HTTP streams
+          // at near-real-time speed so the carrier-side buffer stays bounded
+          // without mark-gated pacing.  Routing streaming chunks through
+          // sendPacedFirstMessageBytes caused crackling: its drain+reset on
+          // every HTTP chunk destroyed mark back-pressure continuity and the
+          // per-sub-chunk sleep slowed delivery below Twilio's playout rate,
+          // producing periodic buffer underruns.  The prewarm path (a single
+          // pre-synthesised buffer) still uses sendPacedFirstMessageBytes
+          // because that buffer can be several seconds long and needs pacing.
+          for await (const chunk of this.tts.synthesizeStream(this.deps.agent.firstMessage)) {
+            if (!this.isSpeaking) break;
+            if (!firstChunkSent) {
+              firstChunkSent = true;
+              this.metricsAcc.recordTtsFirstByte();
+              await this.emitAudioOut();
+            }
+            if (this.aec) this.aec.pushFarEnd(chunk);
+            const encoded = this.encodePipelineAudio(chunk);
+            this.deps.bridge.sendAudio(this.ws, encoded, this.streamSid);
+            this.markFirstAudioSent();
           }
-          const encoded = this.encodePipelineAudio(chunk);
-          this.deps.bridge.sendAudio(this.ws, encoded, this.streamSid);
         }
       } catch (e) {
         getLogger().error(`First message TTS error (${label}):`, e);
@@ -1249,6 +1814,15 @@ export class StreamHandler {
         this.endSpeakingWithGrace();
       }
       if (firstChunkSent) {
+        // Bill the firstMessage TTS characters — they were synthesised
+        // at ElevenLabs (or the configured TTS provider) and the
+        // customer pays for them. The previous flow only called
+        // ``recordTurnComplete`` here, which finalises the turn but does
+        // NOT increment the TTS char counter — so a 5-turn call with an
+        // 82-char greeting was under-billed by ~22% on TTS cost.
+        // ``recordTtsComplete`` is the canonical accumulator entry
+        // point for TTS char billing (parity with Python fix).
+        this.metricsAcc.recordTtsComplete(this.deps.agent.firstMessage);
         await this.emitTurnMetrics(this.metricsAcc.recordTurnComplete(this.deps.agent.firstMessage));
         this.history.push({ role: 'assistant', text: this.deps.agent.firstMessage, timestamp: Date.now() });
       }
@@ -1294,6 +1868,18 @@ export class StreamHandler {
     }
 
     if (this.stt) {
+      // Make sure the STT WebSocket is OPEN before we install the
+      // transcript handler — the parallel kickoff above may still be
+      // resolving when we get here. Failures abort the call.
+      if (sttConnectPromise) {
+        try {
+          await sttConnectPromise;
+        } catch (e) {
+          getLogger().error(`STT connect FAILED (${label}):`, e);
+          try { await this.deps.bridge.endCall(this.callId, this.ws); } catch { /* best effort */ }
+          return;
+        }
+      }
       this.stt.onTranscript(async (transcript) => {
         await this.handleTranscript(transcript);
       });
@@ -1364,6 +1950,7 @@ export class StreamHandler {
         }
         const encoded = this.encodePipelineAudio(processedAudio);
         this.deps.bridge.sendAudio(this.ws, encoded, this.streamSid);
+        this.markFirstAudioSent();
       }
     } catch (e) {
       getLogger().error(`TTS streaming error (${this.deps.bridge.label}):`, e);
@@ -1412,7 +1999,16 @@ export class StreamHandler {
     }
 
     if (!transcript.isFinal || !transcript.text) return;
-    if (!this.commitTranscript(transcript.text)) return;
+    if (!this.commitTranscript(transcript.text)) {
+      // Final transcript dropped (dedup / hallucination / back-to-back).
+      // Any VAD ``speech_end`` that fired during this dropped utterance
+      // already stamped ``_endpointSignalAt``; if we leave it there, the
+      // NEXT legitimate utterance inherits the stale anchor (its
+      // agent_response_ms then includes the silence gap between the
+      // dropped utterance and the real one).
+      this.metricsAcc.anchorUserSpeechStart();
+      return;
+    }
 
     const label = this.deps.bridge.label;
     // [DIAG-2026-05-05] Temporary INFO. Remove once root cause known.
@@ -1518,6 +2114,11 @@ export class StreamHandler {
     } else if (this.llmLoop) {
       responseText = await this.runPipelineLlm(filteredTranscript, hookExecutor, hookCtx);
     } else {
+      getLogger().warn(
+        `Pipeline (${label}) has no llm/onMessage handler — transcript ` +
+          `"${sanitizeLogValue(filteredTranscript.slice(0, 60))}" dropped. ` +
+          'Check that agent.llm or onMessage is configured.',
+      );
       return;
     }
 
@@ -1548,20 +2149,93 @@ export class StreamHandler {
    * record the interruption, and return ``true`` so the caller skips the
    * turn-complete record.
    */
-  private handleBargeIn(transcript: { text?: string }): boolean {
+  private async handleBargeInAsync(transcript: {
+    text?: string;
+    isFinal?: boolean;
+  }): Promise<boolean> {
     if (!transcript.text || !this.isSpeaking) return false;
     if (!this.canBargeIn()) {
-      // Same rationale as the VAD-path gate in handleAudio: gate is
-      // 1 s with AEC (filter warmup) or 250 ms without (anti-flicker).
       getLogger().info(
         `Barge-in transcript suppressed (agent speaking < gate, aec=${this.aec ? 'on' : 'off'})`,
       );
       return false;
     }
-    getLogger().debug(
-      `Barge-in: caller spoke over agent (${sanitizeLogValue(transcript.text.slice(0, 40))})`,
+    if (this.bargeInStrategies.length > 0) {
+      const { evaluateStrategies } = await import(
+        './services/barge-in-strategies.js'
+      );
+      const confirmed = await evaluateStrategies(this.bargeInStrategies, {
+        transcript: transcript.text,
+        isInterim: transcript.isFinal === false,
+        agentSpeaking: this.isSpeaking,
+      });
+      if (!confirmed) {
+        getLogger().debug(
+          `Barge-in NOT confirmed by any strategy (${sanitizeLogValue(
+            transcript.text.slice(0, 40),
+          )}); agent continues talking`,
+        );
+        return false;
+      }
+      getLogger().info(
+        `Barge-in confirmed by strategy on transcript ${sanitizeLogValue(
+          transcript.text.slice(0, 40),
+        )}`,
+      );
+    }
+    this.runBargeInCancel(transcript.text);
+    return true;
+  }
+
+  /**
+   * Synchronous wrapper that callers in legacy code paths can keep using.
+   * When ``bargeInStrategies`` is empty the work is fully synchronous and
+   * the result is correct. With strategies the call is dispatched as a
+   * floating promise — non-confirmed transcripts simply skip the cancel
+   * and the legacy boolean return is meaningless under that opt-in path.
+   */
+  private handleBargeIn(transcript: { text?: string; isFinal?: boolean }): boolean {
+    if (!transcript.text || !this.isSpeaking) return false;
+    if (this.bargeInStrategies.length === 0) {
+      // Legacy synchronous path — preserve exact byte-for-byte behaviour
+      // for users who haven't opted into the confirm pipeline.
+      if (!this.canBargeIn()) {
+        getLogger().info(
+          `Barge-in transcript suppressed (agent speaking < gate, aec=${this.aec ? 'on' : 'off'})`,
+        );
+        return false;
+      }
+      this.runBargeInCancel(transcript.text);
+      return true;
+    }
+    // Opt-in confirm path is async; fire-and-forget. The cancel inside
+    // ``runBargeInCancel`` flips ``isSpeaking`` synchronously once it
+    // resolves, which is what downstream loops actually observe.
+    void this.handleBargeInAsync(transcript).catch((err) =>
+      getLogger().debug(`handleBargeInAsync threw: ${String(err)}`),
     );
-    this.metricsAcc.recordOverlapStart();
+    return false;
+  }
+
+  /**
+   * Run the cancel/flush sequence for a confirmed barge-in. Shared by
+   * the legacy synchronous path and the strategy-confirmed async path.
+   */
+  private runBargeInCancel(transcriptText: string): void {
+    // Capture pending state BEFORE clearPendingBargeIn() drops it — if VAD
+    // already started the overlap window via ``startPendingBargeIn`` we MUST
+    // NOT call ``recordOverlapStart`` again (that would overwrite T1 with
+    // T2 and produce a near-zero ``InterruptionMetrics.detection_delay_ms``
+    // on the strategy path).
+    const hadPending = this.bargeInPendingSince !== null;
+    this.clearPendingBargeIn();
+    getLogger().debug(
+      `Barge-in: caller spoke over agent (${sanitizeLogValue(transcriptText.slice(0, 40))})`,
+    );
+    if (!hadPending) {
+      // Legacy path or VAD never fired — start the overlap window now.
+      this.metricsAcc.recordOverlapStart();
+    }
     this.metricsAcc.recordBargeinDetected();
     const bargeinSpan = startSpan(SPAN_BARGEIN, { 'patter.call.id': this.callId });
     try {
@@ -1573,6 +2247,9 @@ export class StreamHandler {
       }
       this.metricsAcc.recordTtsStopped();
       this.metricsAcc.recordTurnInterrupted();
+      // Re-anchor turn metrics to the legitimate VAD speech_start so post-
+      // barge-in latency anchors don't carry over from the interrupted turn.
+      this.metricsAcc.anchorUserSpeechStart();
       this.metricsAcc.recordOverlapEnd(true);
     } finally {
       try {
@@ -1581,7 +2258,37 @@ export class StreamHandler {
         // Swallow.
       }
     }
-    return true;
+  }
+
+  /** Mark a VAD-detected barge-in as pending (no cancel yet). */
+  private startPendingBargeIn(): void {
+    if (this.bargeInPendingSince !== null) return;
+    this.bargeInPendingSince = Date.now();
+    this.metricsAcc.recordOverlapStart();
+    getLogger().info(
+      'Barge-in PENDING (VAD speech_start during TTS); awaiting strategy confirmation',
+    );
+    this.bargeInPendingTimer = setTimeout(() => {
+      if (this.bargeInPendingSince === null) return;
+      getLogger().info(
+        `Pending barge-in timed out after ${this.bargeInConfirmMs}ms; agent resumes (no strategy confirmed)`,
+      );
+      this.metricsAcc.recordOverlapEnd(false);
+      // Clear any anchors that drifted during the pending barge-in window.
+      this.metricsAcc.anchorUserSpeechStart();
+      this.bargeInPendingSince = null;
+      this.bargeInPendingTimer = null;
+    }, this.bargeInConfirmMs);
+  }
+
+  /** Drop pending state without cancelling — used on confirm and on
+   * agent stop. Idempotent. */
+  private clearPendingBargeIn(): void {
+    if (this.bargeInPendingTimer !== null) {
+      clearTimeout(this.bargeInPendingTimer);
+      this.bargeInPendingTimer = null;
+    }
+    this.bargeInPendingSince = null;
   }
 
   /**
@@ -1796,6 +2503,7 @@ export class StreamHandler {
             if (!wsTtsStarted) { wsTtsStarted = true; this.metricsAcc.recordTtsFirstByte(); await this.emitAudioOut(); }
             const encoded = this.encodePipelineAudio(audioChunk);
             this.deps.bridge.sendAudio(this.ws, encoded, this.streamSid);
+            this.markFirstAudioSent();
           }
         }
       }
@@ -1975,6 +2683,7 @@ export class StreamHandler {
     // reusing it on the outbound path corrupts both directions.
     const outAudio = eventData;
     this.deps.bridge.sendAudio(this.ws, outAudio.toString('base64'), this.streamSid);
+    this.markFirstAudioSent();
     // Send mark for barge-in accuracy.
     this.chunkCount++;
     this.deps.bridge.sendMark(this.ws, `audio_${this.chunkCount}`, this.streamSid);
@@ -2423,11 +3132,17 @@ export class StreamHandler {
     };
 
     // Single INFO line per call-end — duration, turns, cost, latency.
+    // "p95 wait" = agent_response_ms (user-perceived wait after they stop
+    // speaking). Matches the dashboard "p95 wait" tile. Fallback to total_ms
+    // for legacy/short calls where agent_response_ms is undefined.
     const cost = (finalMetrics.cost as { total?: number } | undefined)?.total ?? 0;
-    const latencyP95 = (finalMetrics.latency_p95 as { total_ms?: number } | undefined)?.total_ms ?? 0;
+    const p95Obj = finalMetrics.latency_p95 as
+      | { agent_response_ms?: number; total_ms?: number }
+      | undefined;
+    const latencyP95 = p95Obj?.agent_response_ms ?? p95Obj?.total_ms ?? 0;
     getLogger().info(
       `Call ended: ${this.callId} (${finalMetrics.duration_seconds.toFixed(1)}s, ` +
-        `${finalMetrics.turns.length} turns, cost=$${cost.toFixed(4)}, p95=${Math.round(latencyP95)}ms)`,
+        `${finalMetrics.turns.length} turns, cost=$${cost.toFixed(4)}, p95 wait=${Math.round(latencyP95)}ms)`,
     );
     this.deps.metricsStore.recordCallEnd(
       callEndData,

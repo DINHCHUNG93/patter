@@ -101,6 +101,8 @@ export interface CerebrasLLMOptions {
  *     - zai-glm-4.7
  */
 export class CerebrasLLMProvider implements LLMProvider {
+  /** Stable pricing/dashboard key — read by stream-handler/metrics. */
+  static readonly providerKey = 'cerebras';
   private readonly apiKey: string;
   readonly model: string;
   private readonly baseUrl: string;
@@ -141,6 +143,22 @@ export class CerebrasLLMProvider implements LLMProvider {
     this.frequencyPenalty = options.frequencyPenalty;
     this.presencePenalty = options.presencePenalty;
     this.stop = options.stop;
+  }
+
+  /**
+   * Pre-call DNS / TLS warmup for the Cerebras inference endpoint.
+   * Best-effort: 5 s timeout, all exceptions swallowed at debug level.
+   */
+  async warmup(): Promise<void> {
+    try {
+      await fetch(`${this.baseUrl}/models`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch (err) {
+      getLogger().debug(`Cerebras LLM warmup failed (best-effort): ${String(err)}`);
+    }
   }
 
   /** Stream Patter-format LLM chunks from the Cerebras chat completions API. */

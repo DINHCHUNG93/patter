@@ -62,6 +62,16 @@ class MetricsStore:
         self._calls: list[dict[str, Any]] = []
         self._active_calls: dict[str, dict[str, Any]] = {}
         self._subscribers: set[asyncio.Queue] = set()
+        # User-driven soft delete: call_ids the operator has removed from the
+        # dashboard. The on-disk artefacts (metadata.json, transcript.jsonl)
+        # are intentionally NOT touched — they serve as the durable backup.
+        # All read paths (``get_calls`` / ``get_call`` / ``get_aggregates`` /
+        # ``get_calls_in_range`` / ``hydrate``) filter against this set so
+        # the call is invisible to the UI and excluded from rolling metrics.
+        # Populated from ``<log_root>/.deleted_call_ids.json`` on hydrate so
+        # deletions survive a process restart.
+        self._deleted_call_ids: set[str] = set()
+        self._deleted_ids_path: str | None = None
 
     # --- SSE event bus ---
 
@@ -115,16 +125,19 @@ class MetricsStore:
             # If the call was pre-registered with ``record_call_initiated``
             # (e.g., outbound dial before media arrives), upgrade its status
             # to "in-progress" instead of overwriting the from/to metadata.
-            # Only overwrite ``direction`` when the caller explicitly passed
-            # one in ``data`` — otherwise we'd clobber the ``outbound`` set
-            # by ``record_call_initiated`` with the default ``inbound``.
+            # Only overwrite ``caller`` / ``callee`` / ``direction`` when the
+            # caller explicitly passed a non-empty value in ``data`` —
+            # otherwise we'd clobber the values set by
+            # ``record_call_initiated`` with the empty strings the bridge
+            # sees on the outbound WS path (``/ws/stream/outbound`` carries
+            # no caller/callee query parameters).
             if existing is not None:
-                update_payload = {
-                    "call_id": event_data["call_id"],
-                    "caller": event_data["caller"],
-                    "callee": event_data["callee"],
-                }
-                if "direction" in data:
+                update_payload: dict[str, Any] = {"call_id": event_data["call_id"]}
+                if event_data["caller"]:
+                    update_payload["caller"] = event_data["caller"]
+                if event_data["callee"]:
+                    update_payload["callee"] = event_data["callee"]
+                if "direction" in data and data["direction"]:
                     update_payload["direction"] = data["direction"]
                 existing.update(update_payload)
                 existing["status"] = "in-progress"
@@ -244,27 +257,55 @@ class MetricsStore:
             return
         with self._lock:
             active = self._active_calls.pop(call_id, None)
+            # The Twilio ``statusCallback`` for ``CallStatus=completed``
+            # arrives shortly before the WS ``stop`` frame and runs
+            # ``update_call_status``, which already moved the row from
+            # ``_active_calls`` into ``_calls``. By the time
+            # ``record_call_end`` runs the active record is gone and the
+            # completed entry already exists. Without this lookup we'd
+            # append a second row with ``started_at=0`` (no active to copy
+            # from) and empty caller/callee — which is then ranked first
+            # by ``get_calls`` (newest wins) and the older, well-formed
+            # row gets shadowed. End result: the call disappears from the
+            # dashboard's 24 h window. See dashboard BUG C.
+            existing_idx = -1
+            existing: dict[str, Any] | None = None
+            if active is None:
+                for idx in range(len(self._calls) - 1, -1, -1):
+                    if self._calls[idx].get("call_id") == call_id:
+                        existing_idx = idx
+                        existing = self._calls[idx]
+                        break
+
             entry: dict[str, Any] = {
                 "call_id": call_id,
                 "ended_at": time.time(),
                 "transcript": data.get("transcript", []),
             }
-            if active:
-                entry["caller"] = active.get("caller", "")
-                entry["callee"] = active.get("callee", "")
-                entry["direction"] = active.get("direction", "inbound")
-                entry["started_at"] = active.get("started_at", 0)
+            source = active or existing
+            if source:
+                entry["caller"] = source.get("caller", "")
+                entry["callee"] = source.get("callee", "")
+                entry["direction"] = source.get("direction", "inbound")
+                entry["started_at"] = source.get("started_at", 0)
                 # Preserve any explicit status (no-answer, busy, ...) set by
                 # a statusCallback during the call. Fall back to "completed".
+                prior_status = source.get("status")
                 entry["status"] = (
-                    active.get("status", "completed")
-                    if active.get("status") != "in-progress"
+                    prior_status
+                    if prior_status and prior_status != "in-progress"
                     else "completed"
                 )
             else:
                 entry.setdefault("status", "completed")
             if metrics is not None:
                 entry["metrics"] = asdict(metrics)
+            elif existing is not None and existing.get("metrics"):
+                # An earlier ``update_call_status`` may have written a
+                # placeholder metrics dict — keep it rather than dropping
+                # it on the floor when ``record_call_end`` is invoked
+                # without an explicit metrics payload.
+                entry["metrics"] = existing["metrics"]
             else:
                 # No metrics payload (e.g. webhook-rejected inbound, or
                 # outbound call that never hit media): synthesise a minimal
@@ -288,9 +329,13 @@ class MetricsStore:
                     "latency_p99": {"total_ms": 0.0},
                     "provider_mode": "",
                 }
-            self._calls.append(entry)
-            if len(self._calls) > self._max_calls:
-                self._calls = self._calls[-self._max_calls :]
+            if existing_idx >= 0:
+                # Update in place so the buffer doesn't grow a duplicate row.
+                self._calls[existing_idx] = entry
+            else:
+                self._calls.append(entry)
+                if len(self._calls) > self._max_calls:
+                    self._calls = self._calls[-self._max_calls :]
             event_metrics = entry.get("metrics")
         # Publish outside lock to avoid deadlock with subscribe/unsubscribe
         self._publish(
@@ -302,18 +347,116 @@ class MetricsStore:
         )
 
     def get_calls(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-        """Return the most recent completed calls, newest first."""
+        """Return the most recent completed calls, newest first.
+
+        Soft-deleted call_ids (see :py:meth:`delete_calls`) are filtered out
+        so the dashboard never re-shows a row the user removed. The on-disk
+        artefacts are intentionally preserved as a backup.
+        """
         with self._lock:
-            ordered = list(reversed(self._calls))
+            ordered = [
+                c
+                for c in reversed(self._calls)
+                if c.get("call_id") not in self._deleted_call_ids
+            ]
             return ordered[offset : offset + limit]
 
     def get_call(self, call_id: str) -> dict[str, Any] | None:
-        """Return the completed-call record for ``call_id`` if present."""
+        """Return the completed-call record for ``call_id`` if present.
+
+        Soft-deleted call_ids resolve to ``None`` so the SPA's detail pane
+        cannot render a row the user removed (it falls back to the live
+        record only when ``get_call`` returns ``None``, but a deleted call
+        is never live by construction).
+        """
         with self._lock:
+            if call_id in self._deleted_call_ids:
+                return None
             for call in reversed(self._calls):
                 if call["call_id"] == call_id:
                     return call
             return None
+
+    # --- Soft delete ---
+
+    def delete_calls(self, call_ids: list[str] | set[str]) -> list[str]:
+        """Soft-delete one or more calls from the dashboard view.
+
+        Adds each ``call_id`` to an in-memory set. Subsequent reads via
+        :py:meth:`get_calls` / :py:meth:`get_call` /
+        :py:meth:`get_aggregates` / :py:meth:`get_calls_in_range` exclude
+        the deleted ids, so rolling metrics (avg latency, total spend) are
+        recomputed without them. The on-disk ``metadata.json`` /
+        ``transcript.jsonl`` files written by ``CallLogger`` are NOT
+        touched — they serve as a durable backup the operator can audit
+        outside the dashboard.
+
+        **Active calls are never deletable.** A call_id that is currently
+        in ``_active_calls`` is silently skipped so a mid-call delete
+        from the UI cannot orphan the live transcript pane.
+
+        The deleted set is persisted to ``<log_root>/.deleted_call_ids.json``
+        when :py:meth:`hydrate` has been called with a log root — so the
+        deletion survives process restart. Persistence is best-effort; an
+        I/O error is logged at debug level and swallowed.
+
+        Args:
+            call_ids: Iterable of call_id strings to mark deleted. Empty or
+                already-deleted ids are de-duplicated. Active call_ids are
+                filtered out.
+
+        Returns:
+            The list of call_ids actually accepted as deleted (post-filter).
+        """
+        ids = {cid for cid in (call_ids or []) if isinstance(cid, str) and cid}
+        if not ids:
+            return []
+        with self._lock:
+            # Filter out active calls — never delete a live row.
+            ids -= set(self._active_calls.keys())
+            # De-dup against already-deleted.
+            new_ids = ids - self._deleted_call_ids
+            if not new_ids:
+                return []
+            self._deleted_call_ids |= new_ids
+            snapshot = sorted(self._deleted_call_ids)
+        # Persist outside the lock; SSE publish outside the lock.
+        self._persist_deleted_ids(snapshot)
+        accepted = sorted(new_ids)
+        self._publish("calls_deleted", {"call_ids": accepted})
+        return accepted
+
+    def is_deleted(self, call_id: str) -> bool:
+        """Return ``True`` when ``call_id`` was soft-deleted from the dashboard."""
+        with self._lock:
+            return call_id in self._deleted_call_ids
+
+    def get_deleted_call_ids(self) -> list[str]:
+        """Return a snapshot of the soft-deleted call_ids (sorted)."""
+        with self._lock:
+            return sorted(self._deleted_call_ids)
+
+    def _persist_deleted_ids(self, snapshot: list[str]) -> None:
+        """Atomically write the deleted-ids set to disk. Best-effort."""
+        if self._deleted_ids_path is None:
+            return
+        import json
+        import logging
+        import os
+        from pathlib import Path
+
+        path = Path(self._deleted_ids_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            payload = {"version": 1, "deleted_call_ids": snapshot}
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            os.replace(tmp, path)
+        except OSError as exc:
+            logging.getLogger("getpatter.dashboard.store").debug(
+                "MetricsStore._persist_deleted_ids: %s", exc
+            )
 
     def get_active_calls(self) -> list[dict[str, Any]]:
         """Return the currently in-flight calls."""
@@ -331,9 +474,17 @@ class MetricsStore:
             return self._active_calls.get(call_id)
 
     def get_aggregates(self) -> dict[str, Any]:
-        """Compute aggregate stats (call count, cost, avg duration, latency) across history."""
+        """Compute aggregate stats (call count, cost, avg duration, latency) across history.
+
+        Soft-deleted calls are excluded so rolling metrics (avg latency,
+        total spend) are recomputed without them — matching what the
+        operator sees in the call list.
+        """
         with self._lock:
-            total_calls = len(self._calls)
+            visible = [
+                c for c in self._calls if c.get("call_id") not in self._deleted_call_ids
+            ]
+            total_calls = len(visible)
             if total_calls == 0:
                 return {
                     "total_calls": 0,
@@ -358,7 +509,7 @@ class MetricsStore:
             cost_llm = 0.0
             cost_tel = 0.0
 
-            for call in self._calls:
+            for call in visible:
                 m = call.get("metrics")
                 if m is None:
                     continue
@@ -370,7 +521,10 @@ class MetricsStore:
                 cost_tel += cost.get("telephony", 0.0)
                 total_duration += m.get("duration_seconds", 0.0)
                 avg_lat = m.get("latency_avg", {})
-                t_ms = avg_lat.get("total_ms", 0.0)
+                # Prefer the user-perceived wait time (agent_response_ms);
+                # fall back to round-trip total_ms only when the SDK
+                # didn't record the breakdown (legacy hydrate path).
+                t_ms = avg_lat.get("agent_response_ms") or avg_lat.get("total_ms", 0.0)
                 if t_ms > 0:
                     total_latency += t_ms
                     latency_count += 1
@@ -394,10 +548,16 @@ class MetricsStore:
     def get_calls_in_range(
         self, from_ts: float = 0.0, to_ts: float = 0.0
     ) -> list[dict[str, Any]]:
-        """Return calls within a timestamp range (inclusive)."""
+        """Return calls within a timestamp range (inclusive).
+
+        Soft-deleted calls are filtered out so date-range exports and
+        analytics never include rows the operator removed from the UI.
+        """
         with self._lock:
             result = []
             for call in self._calls:
+                if call.get("call_id") in self._deleted_call_ids:
+                    continue
                 started = call.get("started_at", 0)
                 if from_ts and started < from_ts:
                     continue
@@ -408,9 +568,11 @@ class MetricsStore:
 
     @property
     def call_count(self) -> int:
-        """Number of completed calls currently held in memory."""
+        """Number of completed (non-deleted) calls currently held in memory."""
         with self._lock:
-            return len(self._calls)
+            return sum(
+                1 for c in self._calls if c.get("call_id") not in self._deleted_call_ids
+            )
 
     def hydrate(self, log_root: str | None) -> int:
         """Rebuild the call list from on-disk metadata.json files.
@@ -434,11 +596,37 @@ class MetricsStore:
 
         if not log_root:
             return 0
+        log = logging.getLogger("getpatter.dashboard.store")
+
+        # Wire the deleted-ids persistence path FIRST so any subsequent
+        # ``delete_calls`` call (even before any history hydrates) lands
+        # in the right file. Restoring the set from disk happens here too
+        # so deletions survive a process restart.
+        deleted_ids_path = Path(log_root) / ".deleted_call_ids.json"
+        loaded_deleted: set[str] = set()
+        if deleted_ids_path.is_file():
+            try:
+                with open(deleted_ids_path, encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                raw = payload.get("deleted_call_ids", [])
+                if isinstance(raw, list):
+                    loaded_deleted = {
+                        cid for cid in raw if isinstance(cid, str) and cid
+                    }
+            except (OSError, json.JSONDecodeError) as exc:
+                log.debug(
+                    "MetricsStore.hydrate: skipping %s: %s",
+                    deleted_ids_path,
+                    exc,
+                )
+        with self._lock:
+            self._deleted_ids_path = str(deleted_ids_path)
+            self._deleted_call_ids |= loaded_deleted
+
         calls_root = Path(log_root) / "calls"
         if not calls_root.is_dir():
             return 0
 
-        log = logging.getLogger("getpatter.dashboard.store")
         collected: list[dict[str, Any]] = []
         with self._lock:
             seen = {c.get("call_id") for c in self._calls if c.get("call_id")}
@@ -507,6 +695,53 @@ def _numeric_subdirs(parent):
             yield entry
 
 
+def _metrics_from_top_level(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a ``metrics`` dict from top-level CallLogger fields.
+
+    ``CallLogger.log_call_end`` writes ``cost`` / ``latency`` / ``duration_ms`` /
+    ``telephony_provider`` as top-level keys in ``metadata.json``, but the
+    dashboard UI expects them under ``metrics``. Without this fallback every
+    hydrated call shows ``$0.00`` and ``—`` for cost and latency.
+    """
+    cost = meta.get("cost") if isinstance(meta.get("cost"), dict) else None
+    latency = meta.get("latency") if isinstance(meta.get("latency"), dict) else None
+    duration_ms = meta.get("duration_ms")
+    telephony = meta.get("telephony_provider")
+    if cost is None and latency is None and duration_ms is None and not telephony:
+        return None
+    out: dict[str, Any] = {}
+    if cost is not None:
+        out["cost"] = cost
+    if latency is not None:
+        # Prefer the full LatencyBreakdown objects (avg/p50/p95/p99) when
+        # the server persisted them. Old metadata.json files only carry
+        # flat ``p50_ms/p95_ms/p99_ms`` totals — synthesize a minimal
+        # latency_avg from those so the table still shows a number, but
+        # no breakdown is available for those historical rows.
+        full_avg = latency.get("avg") if isinstance(latency.get("avg"), dict) else None
+        full_p50 = latency.get("p50") if isinstance(latency.get("p50"), dict) else None
+        full_p95 = latency.get("p95") if isinstance(latency.get("p95"), dict) else None
+        full_p99 = latency.get("p99") if isinstance(latency.get("p99"), dict) else None
+        if full_avg:
+            out["latency_avg"] = full_avg
+        if full_p50:
+            out["latency_p50"] = full_p50
+        if full_p95:
+            out["latency_p95"] = full_p95
+        if full_p99:
+            out["latency_p99"] = full_p99
+        if not (full_avg or full_p50 or full_p95):
+            out["latency_avg"] = {
+                "total_ms": latency.get("p95_ms") or latency.get("p50_ms") or 0
+            }
+        out["latency"] = latency
+    if isinstance(duration_ms, (int, float)) and duration_ms > 0:
+        out["duration_seconds"] = float(duration_ms) / 1000.0
+    if telephony:
+        out["telephony_provider"] = telephony
+    return out or None
+
+
 def _metadata_to_call_record(
     call_id: str, meta: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -533,6 +768,8 @@ def _metadata_to_call_record(
         return None
     ended = _to_seconds(meta.get("ended_at"))
     metrics = meta.get("metrics") if isinstance(meta.get("metrics"), dict) else None
+    if metrics is None:
+        metrics = _metrics_from_top_level(meta)
     transcript = (
         meta.get("transcript") if isinstance(meta.get("transcript"), list) else []
     )

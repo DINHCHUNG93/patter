@@ -13,7 +13,7 @@ calls fail fast instead of silently dropping back to ``whisper-1``.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import ClassVar, Literal
 
 from getpatter.providers.whisper_stt import WhisperSTT
 
@@ -38,6 +38,9 @@ class OpenAITranscribeSTT(WhisperSTT):
         response_format: ``"json"`` (default) or ``"verbose_json"``.
     """
 
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "openai_transcribe"
+
     def __init__(
         self,
         api_key: str,
@@ -57,3 +60,8 @@ class OpenAITranscribeSTT(WhisperSTT):
             model=model,
             response_format=response_format,
         )
+        # Observability: ``_record_transcript_cost`` is inherited from
+        # ``WhisperSTT`` and emits ``patter.stt.provider="whisper"``. This
+        # is intentional — gpt-4o-transcribe shares the Whisper cost table,
+        # so a single tag keeps the dashboard's per-provider rollup
+        # consistent across the OpenAI transcription family.

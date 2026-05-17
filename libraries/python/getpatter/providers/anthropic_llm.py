@@ -20,7 +20,7 @@ import json
 import logging
 import os
 from enum import StrEnum
-from typing import AsyncIterator
+from typing import ClassVar, AsyncIterator
 
 logger = logging.getLogger("getpatter")
 
@@ -94,6 +94,9 @@ class AnthropicLLMProvider:
                 debugging or A/B comparisons.
     """
 
+    #: Stable pricing/dashboard key — read by stream-handler/metrics.
+    provider_key: ClassVar[str] = "anthropic"
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -126,6 +129,35 @@ class AnthropicLLMProvider:
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._prompt_caching = prompt_caching
+
+    async def warmup(self) -> None:
+        """Pre-call DNS / TLS warmup for the Anthropic Messages API.
+
+        Issues a lightweight ``GET https://api.anthropic.com/v1/models``
+        so DNS, TLS, and HTTP/2 are already up by the time the first
+        ``messages.stream`` call lands. Best-effort: 5 s timeout, all
+        exceptions swallowed at DEBUG.
+        """
+        try:
+            base_url = str(
+                getattr(self._client, "base_url", "") or "https://api.anthropic.com"
+            ).rstrip("/")
+            if "/v1" not in base_url:
+                models_url = f"{base_url}/v1/models"
+            else:
+                models_url = f"{base_url}/models"
+            import httpx
+
+            async with httpx.AsyncClient(timeout=5.0) as http:
+                await http.get(
+                    models_url,
+                    headers={
+                        "x-api-key": self._client.api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            logger.debug("Anthropic LLM warmup failed (best-effort): %s", exc)
 
     async def stream(
         self,
@@ -187,11 +219,33 @@ class AnthropicLLMProvider:
         current_tool_id: str | None = None
         current_tool_index: int | None = None
 
+        # ``message_start`` carries ``input_tokens`` (and an initial
+        # ``output_tokens`` placeholder); ``message_delta`` carries the
+        # running ``output_tokens`` total. Capture both so the cost helper
+        # sees the final figures.
+        prompt_tokens = 0
+        completion_tokens = 0
+
         async with self._client.messages.stream(**kwargs) as stream:
             async for event in stream:
                 if cancel_event is not None and cancel_event.is_set():
                     return  # exiting the ``async with`` closes the upstream stream
                 event_type = getattr(event, "type", None)
+
+                if event_type == "message_start":
+                    msg = getattr(event, "message", None)
+                    usage = getattr(msg, "usage", None) if msg is not None else None
+                    if usage is not None:
+                        prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+                        completion_tokens = getattr(usage, "output_tokens", 0) or 0
+
+                elif event_type == "message_delta":
+                    usage = getattr(event, "usage", None)
+                    if usage is not None:
+                        completion_tokens = (
+                            getattr(usage, "output_tokens", completion_tokens)
+                            or completion_tokens
+                        )
 
                 if event_type == "content_block_start":
                     block = getattr(event, "content_block", None)
@@ -234,7 +288,30 @@ class AnthropicLLMProvider:
                     current_tool_id = None
                     current_tool_index = None
 
+        if prompt_tokens or completion_tokens:
+            self._record_completion_cost(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+
         yield {"type": "done"}
+
+    def _record_completion_cost(
+        self, *, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        """Stamp ``patter.cost.llm_*_tokens`` on the current span."""
+        try:
+            from getpatter.observability.attributes import record_patter_attrs
+
+            record_patter_attrs(
+                {
+                    "patter.cost.llm_input_tokens": prompt_tokens,
+                    "patter.cost.llm_output_tokens": completion_tokens,
+                    "patter.llm.provider": "anthropic",
+                }
+            )
+        except Exception:  # pragma: no cover — defense in depth
+            logger.debug("_record_completion_cost failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

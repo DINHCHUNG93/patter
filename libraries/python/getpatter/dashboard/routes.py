@@ -53,7 +53,14 @@ def mount_dashboard(app, store: MetricsStore, token: str = "") -> None:
 
     @app.get("/api/dashboard/calls/{call_id}")
     async def dashboard_call_detail(call_id: str, _=Depends(auth)):
+        # Fall back to the active record so the live-transcript polling
+        # path (``useTranscript`` in the dashboard SPA) sees turns as
+        # they accumulate during the call. Without this fallback the
+        # route 404s while the call is in flight and the live transcript
+        # pane stays empty.
         call = store.get_call(call_id)
+        if call is None:
+            call = store.get_active(call_id)
         if call is None:
             return JSONResponse(content={"error": "Not found"}, status_code=404)
         return JSONResponse(content=call)
@@ -65,6 +72,35 @@ def mount_dashboard(app, store: MetricsStore, token: str = "") -> None:
     @app.get("/api/dashboard/aggregates")
     async def dashboard_aggregates(_=Depends(auth)):
         return JSONResponse(content=store.get_aggregates())
+
+    # --- Soft delete ---
+    #
+    # ``DELETE /api/dashboard/calls/{call_id}`` removes a single call from
+    # the dashboard view and aggregate metrics. ``POST
+    # /api/dashboard/calls/delete`` accepts a batch ``{"call_ids": [...]}``.
+    # Both are idempotent and never touch the on-disk artefacts written by
+    # ``CallLogger`` — those serve as the durable backup. Active calls are
+    # silently skipped so a mid-call delete cannot orphan the live pane.
+
+    @app.delete("/api/dashboard/calls/{call_id}", dependencies=[Depends(auth)])
+    async def dashboard_delete_call(call_id: str):
+        accepted = store.delete_calls([call_id])
+        return JSONResponse(content={"deleted": accepted, "count": len(accepted)})
+
+    @app.post("/api/dashboard/calls/delete", dependencies=[Depends(auth)])
+    async def dashboard_delete_calls(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        raw = body.get("call_ids") if isinstance(body, dict) else None
+        if not isinstance(raw, list):
+            return JSONResponse(
+                content={"error": "Expected JSON body {'call_ids': [...]}"},
+                status_code=400,
+            )
+        accepted = store.delete_calls([cid for cid in raw if isinstance(cid, str)])
+        return JSONResponse(content={"deleted": accepted, "count": len(accepted)})
 
     # --- SSE endpoint ---
 
@@ -78,7 +114,7 @@ def mount_dashboard(app, store: MetricsStore, token: str = "") -> None:
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=30.0)
                         event_type = event.get("type", "message")
-                        event_type = re.sub(r'[\r\n]', '', event_type)
+                        event_type = re.sub(r"[\r\n]", "", event_type)
                         data = json.dumps(event.get("data", {}), default=str)
                         yield f"event: {event_type}\ndata: {data}\n\n"
                     except asyncio.TimeoutError:
@@ -89,9 +125,7 @@ def mount_dashboard(app, store: MetricsStore, token: str = "") -> None:
             finally:
                 store.unsubscribe(queue)
 
-        return StreamingResponse(
-            event_generator(), media_type="text/event-stream"
-        )
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     # --- Export endpoint ---
 
