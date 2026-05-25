@@ -58,6 +58,92 @@ describe('CallMetricsAccumulator', () => {
     expect(turn!.tts_characters).toBe(0);
   });
 
+  it('recordTurnComplete is a no-op after recordTurnInterrupted on the same turn', () => {
+    // Repro of the VAD-barge-in / pipeline-LLM race documented in
+    // BUGS.md (2026-05-05). The barge-in path closes the turn with
+    // recordTurnInterrupted while the in-flight pipeline LLM stream
+    // eventually unwinds and reaches recordTurnComplete. Without the
+    // guard, the late call would push a phantom turn with user_text=''
+    // (since _resetTurnState cleared the field) and agent_text from
+    // the cancelled LLM stream.
+    const acc = new CallMetricsAccumulator({
+      callId: 'race1',
+      providerMode: 'pipeline',
+      telephonyProvider: 'twilio',
+    });
+
+    acc.startTurn();
+    acc.recordSttComplete('Hello');
+    const interrupted = acc.recordTurnInterrupted();
+    expect(interrupted).not.toBeNull();
+    expect(interrupted!.user_text).toBe('Hello');
+    expect(interrupted!.agent_text).toBe('[interrupted]');
+
+    // Late pipeline-LLM unwind reaches recordTurnComplete with the
+    // cancelled responseText — must be silently dropped.
+    const late = acc.recordTurnComplete('partial LLM output');
+    expect(late).toBeNull();
+
+    // Only the interrupted turn is recorded.
+    const result = acc.endCall();
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0].agent_text).toBe('[interrupted]');
+    expect(result.turns[0].user_text).toBe('Hello');
+  });
+
+  it('recordTurnInterrupted is a no-op after recordTurnComplete on the same turn', () => {
+    // Bidirectional parity: a late recordTurnInterrupted after
+    // recordTurnComplete on the same turn must also be a no-op. The
+    // current caller ordering can't trigger this (the VAD bargein path
+    // fires the interrupt FIRST and the LLM-unwind path then calls
+    // complete second, guarded by the existing one-directional guard).
+    // The symmetric guard hardens the accumulator against a future
+    // refactor that reorders those paths.
+    const acc = new CallMetricsAccumulator({
+      callId: 'race-bi',
+      providerMode: 'pipeline',
+      telephonyProvider: 'twilio',
+    });
+
+    acc.startTurn();
+    acc.recordSttComplete('Hello');
+    const completed = acc.recordTurnComplete('Hi there');
+    expect(completed).not.toBeNull();
+    expect(completed!.user_text).toBe('Hello');
+    expect(completed!.agent_text).toBe('Hi there');
+
+    // Late VAD-bargein interruption arrives after the complete —
+    // must be silently dropped.
+    const late = acc.recordTurnInterrupted();
+    expect(late).toBeNull();
+
+    // Only the completed turn is recorded.
+    const result = acc.endCall();
+    expect(result.turns).toHaveLength(1);
+    expect(result.turns[0].agent_text).toBe('Hi there');
+  });
+
+  it('startTurn re-arms the accumulator after an interrupted turn', () => {
+    const acc = new CallMetricsAccumulator({
+      callId: 'race2',
+      providerMode: 'pipeline',
+      telephonyProvider: 'twilio',
+    });
+
+    acc.startTurn();
+    acc.recordSttComplete('Hello');
+    acc.recordTurnInterrupted();
+    expect(acc.recordTurnComplete('dropped')).toBeNull();
+
+    // New turn begins.
+    acc.startTurn();
+    acc.recordSttComplete('Second turn');
+    const completed = acc.recordTurnComplete('Reply');
+    expect(completed).not.toBeNull();
+    expect(completed!.user_text).toBe('Second turn');
+    expect(completed!.agent_text).toBe('Reply');
+  });
+
   it('computes cost for pipeline mode', () => {
     const acc = new CallMetricsAccumulator({
       callId: 'c4',

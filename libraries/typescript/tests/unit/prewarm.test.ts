@@ -96,7 +96,45 @@ describe('[unit] prewarm — Agent flag defaults', () => {
     expect(agent.prewarmFirstMessage).toBeUndefined();
     // Default behaviour: prewarm is on unless user explicitly set false.
     expect(agent.prewarm !== false).toBe(true);
-    expect(Boolean(agent.prewarmFirstMessage)).toBe(false);
+  });
+
+  it('phone.agent() leaves prewarmFirstMessage undefined in pipeline mode (opt-in)', () => {
+    // Default-on was reverted on 2026-05-19 after the 0.6.2 acceptance
+    // run showed a phantom-barge-in interaction: the prewarm burst at
+    // pickup tripped Silero VAD on the very first inbound frame and the
+    // firstMessage was cancelled mid-playback. Pipeline mode now leaves
+    // the flag opt-in; callers wanting the prewarm path set it explicitly.
+    const phone = makePatter();
+    const stt = new StubSTT();
+    const tts = new StubTTS();
+    const llm = new StubLLM();
+    const agent = phone.agent({ systemPrompt: 'hi', stt, tts, llm });
+    expect(agent.provider).toBe('pipeline');
+    expect(agent.prewarmFirstMessage).toBeUndefined();
+  });
+
+  it('phone.agent() does NOT default prewarmFirstMessage in realtime mode', () => {
+    // Realtime / ConvAI handlers never consume the prewarm cache; setting
+    // the flag would only waste TTS spend, so the default stays off when
+    // the caller didn't explicitly pick pipeline.
+    const phone = makePatter();
+    const agent = phone.agent({ systemPrompt: 'hi', provider: 'openai_realtime' });
+    expect(agent.prewarmFirstMessage).toBeUndefined();
+  });
+
+  it('phone.agent() preserves explicit prewarmFirstMessage=false in pipeline mode (opt-out)', () => {
+    const phone = makePatter();
+    const stt = new StubSTT();
+    const tts = new StubTTS();
+    const llm = new StubLLM();
+    const agent = phone.agent({
+      systemPrompt: 'hi',
+      stt,
+      tts,
+      llm,
+      prewarmFirstMessage: false,
+    });
+    expect(agent.prewarmFirstMessage).toBe(false);
   });
 });
 

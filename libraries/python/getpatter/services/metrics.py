@@ -90,6 +90,18 @@ class CallMetricsAccumulator:
         self._bargein_stopped_at: float | None = None
         self._turn_user_text: str = ""
         self._turn_stt_audio_seconds: float = 0.0
+        # Guard against the record_turn_interrupted / record_turn_complete
+        # race. A VAD-path barge-in fires ``record_turn_interrupted``
+        # synchronously inside the handler while the in-flight pipeline
+        # LLM stream keeps unwinding on its own task. When the LLM stream
+        # eventually exits, the pipeline path falls through to
+        # ``record_turn_complete``, which would push a second turn for
+        # the same logical exchange (this time carrying ``user_text=""``
+        # because the field was already reset). The flag is flipped by
+        # ``record_turn_interrupted`` and read by ``record_turn_complete``
+        # so the late ``record_turn_complete`` becomes a no-op until the
+        # next ``start_turn`` re-arms the accumulator.
+        self._turn_already_closed: bool = False
         # Cross-turn TTFT storage so _emit_turn_metrics can read it after reset
         self._last_turn_llm_ttft_ms: float = 0.0
 
@@ -201,6 +213,7 @@ class CallMetricsAccumulator:
         self._bargein_stopped_at = None
         self._turn_user_text = ""
         self._turn_stt_audio_seconds = 0.0
+        self._turn_already_closed = False
         # Reset per-turn TTFB guard flags
         self._llm_ttfb_emitted = False
         self._tts_ttfb_emitted = False
@@ -397,8 +410,18 @@ class CallMetricsAccumulator:
         """
         self._bargein_stopped_at = ts if ts is not None else time.monotonic()
 
-    def record_turn_complete(self, agent_text: str) -> TurnMetrics:
-        """Finalize the current turn and return its metrics."""
+    def record_turn_complete(self, agent_text: str) -> TurnMetrics | None:
+        """Finalize the current turn and return its metrics.
+
+        Returns ``None`` when ``record_turn_interrupted`` has already
+        closed the current turn — this protects against the VAD-barge-in
+        / pipeline-LLM race where both paths try to finalise the same
+        logical turn and the second would otherwise push a phantom entry
+        with ``user_text=''``. The caller treats ``None`` as "nothing to
+        emit"; ``_emit_turn_metrics`` is already null-safe.
+        """
+        if self._turn_already_closed:
+            return None
         latency = self._compute_turn_latency()
         turn = TurnMetrics(
             turn_index=len(self._turns),
@@ -420,15 +443,29 @@ class CallMetricsAccumulator:
                 {"call_id": self.call_id, "turn": turn},
             )
         self._reset_turn_state()
+        # Bidirectional guard: mark the turn as closed so a late
+        # record_turn_interrupted (e.g. from a future refactor that
+        # reorders the bargein + LLM-unwind paths) becomes a no-op
+        # instead of overwriting the just-emitted turn record. Mirrors
+        # the inverse guard in ``record_turn_interrupted`` and keeps
+        # the two close paths symmetric.
+        self._turn_already_closed = True
         return turn
 
     def record_turn_interrupted(self) -> TurnMetrics | None:
         """Handle a barge-in / interrupted turn.
 
         Returns partial ``TurnMetrics`` if a turn was in progress, else
-        ``None``.
+        ``None``. Also returns ``None`` when ``record_turn_complete`` has
+        already finalised the current turn — bidirectional parity with
+        the guard in :meth:`record_turn_complete`. Prevents an out-of-
+        order interruption (e.g. a future refactor that reorders the
+        bargein + LLM-unwind paths) from overwriting a turn that the
+        complete path already emitted.
         """
         if self._turn_start is None:
+            return None
+        if self._turn_already_closed:
             return None
 
         latency = self._compute_turn_latency()
@@ -455,6 +492,10 @@ class CallMetricsAccumulator:
                 {"call_id": self.call_id, "turn": turn},
             )
         self._reset_turn_state()
+        # Mark the turn as closed so a late record_turn_complete from
+        # the pipeline-LLM unwind path becomes a no-op (see
+        # _turn_already_closed).
+        self._turn_already_closed = True
         # Extra paranoia: explicitly null out anchors that have caused leaks
         # into subsequent turns when a barge-in is in flight. _reset_turn_state
         # already clears them, but keep this belt-and-braces line so future
@@ -723,6 +764,13 @@ class CallMetricsAccumulator:
         self._tts_first_byte = None
         self._tts_last_byte = None
         self._endpoint_signal_at = None
+        # Parity with TS ``metrics.ts:_resetTurnState`` — without clearing
+        # ``_turn_committed_mono`` here, the ``anchor_user_speech_start``
+        # guard (``if self._turn_committed_mono is not None: return``)
+        # falsely no-ops on a VAD ``speech_start`` arriving between
+        # ``record_turn_complete`` and the next ``start_turn`` on
+        # back-to-back turns.
+        self._turn_committed_mono = None
         self._bargein_detected_at = None
         self._bargein_stopped_at = None
         self._turn_user_text = ""
