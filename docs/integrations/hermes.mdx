@@ -1,19 +1,18 @@
 ---
-title: "OpenClaw"
-description: "Give your OpenClaw agent a phone with Patter — install the skill in one line, configure your Twilio, Telnyx, or Plivo number, and your agent answers calls."
+title: "Hermes Agent"
+description: "Give your Hermes Agent a phone with Patter — install the skill in one line, configure your Twilio or Telnyx number, and your agent makes and receives calls."
 icon: "phone"
 ---
 
-[OpenClaw](https://openclaw.ai) is a self-hosted AI assistant gateway that lets one or
-more LLM-backed agents act on your behalf across WhatsApp, Telegram, Discord, iMessage,
-and more. Once you install the Patter skill, your OpenClaw agent can place outbound
-calls, receive inbound calls, and use the full Patter SDK without any further setup
-on the OpenClaw side.
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) is a self-hosted AI assistant
+that grows with you through modular skills and persistent memory. Once you install the
+Patter skill, your Hermes Agent can place outbound calls, receive inbound calls, and use
+the full Patter SDK without any further setup on the Hermes side.
 
 ## Install
 
 Patter skills work in every agent harness that consumes the
-[Anthropic Agent Skills](https://agentskills.io) standard — OpenClaw included. Install
+[Anthropic Agent Skills](https://agentskills.io) standard — Hermes Agent included. Install
 with one command:
 
 ```bash
@@ -24,9 +23,9 @@ npx skills add patterai/skills
 npx skills add patterai/skills --skill build-voice-agent
 ```
 
-The CLI auto-detects OpenClaw on your machine and creates symlinks from
-`~/.openclaw/skills/` (or your `CLAWD_HOME` override) into the canonical
-`~/.agents/skills/` directory. Restart your Gateway and the agent will pick the
+The CLI auto-detects Hermes Agent on your machine and creates symlinks from
+`~/.hermes/skills/` (or your `HERMES_HOME` override) into the canonical
+`~/.agents/skills/` directory. Restart your Hermes Agent and the agent will pick the
 skills up at session start.
 
 <Tip>
@@ -42,23 +41,23 @@ skills up at session start.
 |---|---|
 | [`setup-patter`](https://github.com/PatterAI/skills/tree/main/setup-patter) | Walk the user through installing Patter and obtaining provider/carrier API keys, with validation. |
 | [`build-voice-agent`](https://github.com/PatterAI/skills/tree/main/build-voice-agent) | Build a voice agent — pick between OpenAI Realtime / ElevenLabs ConvAI / STT→LLM→TTS Pipeline. |
-| [`configure-telephony`](https://github.com/PatterAI/skills/tree/main/configure-telephony) | Wire up Twilio, Telnyx, or Plivo — phone numbers, webhooks, tunnels, AMD, voicemail drop. |
+| [`configure-telephony`](https://github.com/PatterAI/skills/tree/main/configure-telephony) | Wire up Twilio or Telnyx — phone numbers, webhooks, tunnels, AMD, voicemail drop. |
 | [`add-tools-and-handoffs`](https://github.com/PatterAI/skills/tree/main/add-tools-and-handoffs) | Custom tools, `transfer_call`, `end_call`, output guardrails. |
 | [`inspect-calls-and-metrics`](https://github.com/PatterAI/skills/tree/main/inspect-calls-and-metrics) | Live dashboard, `CallMetrics`, cost tracking, CSV/JSON export. |
 
-Every skill ships full Python and TypeScript code examples side-by-side. Your OpenClaw
-agent can pick the runtime that matches the rest of your project.
+Every skill ships full Python and TypeScript code examples side-by-side. Your Hermes
+Agent can pick the runtime that matches the rest of your project.
 
 ## Use Patter as an MCP server (alternative path)
 
-If you want OpenClaw to call Patter through the [Model Context Protocol](https://modelcontextprotocol.io)
+If you want Hermes Agent to call Patter through the [Model Context Protocol](https://modelcontextprotocol.io)
 instead of (or in addition to) the skills, register the Patter MCP server with one
 command:
 
 <CodeGroup>
 
 ```bash stdio
-openclaw mcp set patter '{
+hermes mcp install patter-voice '{
   "command": "npx",
   "args": ["-y", "getpatter-mcp"],
   "env": {
@@ -70,7 +69,7 @@ openclaw mcp set patter '{
 ```
 
 ```bash streamable-http
-openclaw mcp set patter '{
+hermes mcp install patter-voice '{
   "url": "https://patter-mcp.yourdomain.com",
   "transport": "streamable-http",
   "headers": { "Authorization": "Bearer ..." }
@@ -80,21 +79,38 @@ openclaw mcp set patter '{
 </CodeGroup>
 
 The Patter MCP server is hosted at [`PatterAI/patter-mcp`](https://github.com/PatterAI/patter-mcp).
-Once registered, tools surface to your OpenClaw agent under names like `patter__make_call`,
-`patter__get_transcript`, and `patter__list_calls`.
+Once registered, tools surface to your Hermes Agent under names like `patter-voice__make_call`,
+`patter-voice__get_transcript`, and `patter-voice__list_calls`.
 
 <Warning>
-  Allowlist outbound calls. OpenClaw's `before_tool_call.requireApproval` hook
-  applies to native plugins but **not** to MCP tools. If you don't want your agent
-  dialing arbitrary numbers without confirmation, configure
-  `tools.elevated: ["patter__make_call"]` in your OpenClaw `config.yaml`, or wrap
-  the tool in a small native plugin that gates it behind user approval.
+  Allowlist outbound calls. By default, Hermes Agent may invoke MCP tools without
+  explicit approval. If you don't want your agent dialing arbitrary numbers without
+  confirmation, configure `tools.confirm: ["patter-voice__make_call"]` in your Hermes Agent
+  `~/.hermes/config.yaml`, or wrap the tool in a small plugin that gates it behind
+  user approval.
 </Warning>
 
-## Quick start: outbound call from OpenClaw
+## Use as an optional plugin
 
-Once skills are installed and your provider/carrier keys are in `~/.openclaw/.env`,
-ask your OpenClaw agent something like:
+Hermes Agent supports plugin-based integrations. A Patter bundle — an
+`optional-mcps/patter-voice` manifest plus a bundled `patter-voice` skill — is
+proposed for the Hermes catalog in
+[NousResearch/hermes-agent#33937](https://github.com/NousResearch/hermes-agent/pull/33937).
+Once it is merged upstream, a single command installs both the MCP tools and
+the skill:
+
+```bash
+hermes plugin add patter-voice
+```
+
+Until then, install Patter via the skills (`npx skills add patterai/skills`) or
+the MCP server path described above — both work today, with no upstream
+dependency.
+
+## Quick start: outbound call from Hermes Agent
+
+Once skills are installed and your provider/carrier keys are in `~/.hermes/.env`,
+ask your Hermes Agent something like:
 
 > *"Call my plumber at +15550001234 and ask if they have time tomorrow morning.
 > Then text me the summary."*
@@ -102,17 +118,17 @@ ask your OpenClaw agent something like:
 The agent loads `build-voice-agent` automatically (its description triggers on
 phrases like "call", "phone", "voicemail"), writes a small Python or TypeScript
 script using the Patter SDK, runs it, and reports the transcript back to you in
-the OpenClaw thread.
+the Hermes thread.
 
 If you'd prefer to skip the per-call SDK script and have the agent use the MCP
-server tools directly, ensure `patter` is in your `tools.allow` list:
+server tools directly, ensure `patter-voice` is in your `tools.allow` list:
 
 ```yaml
-# ~/.openclaw/config.yaml
+# ~/.hermes/config.yaml
 tools:
   allow:
     - bundle-mcp
-    - patter__*
+    - patter-voice__*
 ```
 
 ## What's next
@@ -132,4 +148,4 @@ tools:
 - Patter SDK source: [https://github.com/PatterAI/Patter](https://github.com/PatterAI/Patter)
 - Patter Skills repository: [https://github.com/PatterAI/skills](https://github.com/PatterAI/skills)
 - Patter Discord: [https://discord.gg/patter](https://discord.gg/patter)
-- OpenClaw docs: [https://docs.openclaw.ai](https://docs.openclaw.ai)
+- Hermes Agent docs: [https://github.com/NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
