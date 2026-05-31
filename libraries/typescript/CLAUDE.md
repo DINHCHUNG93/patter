@@ -1,6 +1,6 @@
 # TypeScript SDK — agent quickstart
 
-This file is the per-library guide for AI agents working in `libraries/typescript/`. For repo-wide rules, see the root `CLAUDE.md` and `.claude/rules/`.
+This file is the per-library guide for AI agents working in `libraries/typescript/`. For repo-wide rules, see [`AGENTS.md`](../../AGENTS.md) and [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ## Layout
 
@@ -22,14 +22,15 @@ libraries/typescript/
     ├── pricing.ts          # PricingUnit + provider price tables
     ├── server.ts           # Express app
     ├── stream-handler.ts   # per-call lifecycle
-    ├── telephony/          # Twilio + Telnyx adapters (twilio.ts / telnyx.ts)
+    ├── telephony/          # Twilio + Telnyx + Plivo adapters (twilio.ts / telnyx.ts / plivo.ts)
+    ├── carrier-config.ts   # carrier audio/format config
     ├── audio/              # transcoding, background-audio
     ├── tools/              # tool-decorator
-    ├── providers/          # voice / LLM / STT / TTS providers
+    ├── providers/          # voice / LLM / STT / TTS provider adapters
     ├── services/           # call-log, ivr (mostly top-level files in src/)
     ├── observability/
     ├── dashboard/
-    ├── tts/ stt/           # public namespaces (env-var auto-resolve)
+    ├── llm/ tts/ stt/      # public provider namespaces (env-var auto-resolve)
     └── ...
 ```
 
