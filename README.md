@@ -1,3 +1,75 @@
+
+📞 SDK mã nguồn mở giúp AI Agent “có số điện thoại thật” chỉ với vài dòng code
+
+Một trong những dự án Voice AI thú vị nhất thời gian gần đây:
+PatterAI/Patter GitHub￼
+
+Điểm đặc biệt:
+Patter không phải chatbot voice thông thường.
+
+Nó là một open-source SDK giúp:
+👉 AI Agent gọi điện thật
+👉 nhận cuộc gọi thật
+👉 nói chuyện realtime qua điện thoại
+
+chỉ với khoảng 4 dòng Python.  
+
+Các tính năng nổi bật:
+
+* Kết nối AI Agent với số điện thoại thật
+* Hỗ trợ Twilio + Telnyx
+* Realtime voice conversation latency cực thấp (~412ms demo)  
+* Built-in:
+    STT + TTS + audio streaming
+* Hỗ trợ barge-in:
+    ngắt lời AI giữa chừng tự nhiên
+* Pipeline architecture:
+    speech-to-speech hoặc modular pipeline
+* OpenTelemetry tracing cho production debugging
+* Python + TypeScript SDK
+* MIT License hoàn toàn mã nguồn mở
+* Tích hợp dễ với:
+    OpenAI Realtime API và voice agents
+
+Điều mình đánh giá rất mạnh:
+Patter giải quyết phần “khó chịu nhất” của Voice AI production:
+
+* telephony
+* carrier failover
+* realtime audio
+* interruption handling
+* tracing/debugging
+
+Thứ mà đa số demo voice AI hiện nay thường bỏ qua.
+
+Repo này đang được gọi là:
+“Vapi/Retell alternative cho người muốn tự làm chủ stack”.  
+
+Một hướng cực tiềm năng:
+kết hợp Patter với:
+
+* Claude Code
+* OpenAI Realtime
+* SenseVoice
+* CosyVoice/F5-TTS
+
+để build:
+
+* AI receptionist
+* AI sales caller
+* AI support hotline
+* AI voice assistant
+* Autonomous phone agents
+
+Điều thú vị nhất:
+Patter đang đưa AI Agents từ:
+“chat window”
+ra ngoài thế giới thật
+thông qua hạ tầng điện thoại truyền thống.
+
+
+
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/PatterAI/Patter/main/docs/github-banner.png" />
